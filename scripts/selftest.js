@@ -47,6 +47,12 @@ function startMock() {
     if (url.startsWith('/v1/chat/completions')) {
       const body = JSON.parse(raw);
       const maxOut = body.max_completion_tokens ?? body.max_tokens ?? 100;
+      // A fussy model that rejects oversized completions, to exercise the
+      // engine's ability to shrink its own numbers instead of failing forever.
+      if (body.model === 'picky-model' && maxOut > 4000) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: { message: 'max_tokens is too large for this model' } }));
+      }
       const out = Math.min(maxOut, MOCK_USAGE.output);
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       for (let i = 0; i < 3; i++) {
@@ -248,6 +254,13 @@ async function main() {
     const snap = await b.run();
     assert.equal(snap.ok, 2);
     assert.ok(snap.total >= 7200, `expected ≥7200, got ${snap.total}`);
+  });
+
+  await testAsync('oversized max_tokens is adapted, not retried forever', async () => {
+    const b = new Burner(cfgFor(port, { modelId: 'picky-model', limitRequests: 4 }));
+    const snap = await b.run();
+    assert.ok(snap.ok > 0, 'should recover after shrinking max_tokens');
+    assert.ok(b.logs.some((l) => /adjusting to provider limits/.test(l.msg)));
   });
 
   await testAsync('dry run sends nothing and reports a plan', async () => {

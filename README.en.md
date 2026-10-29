@@ -183,7 +183,9 @@ Plus MiniMax, xAI, Groq, Mistral, SiliconFlow as templates.
   compensates in a loop, but the final request can still fall short.
 - **Some models refuse.** "Emit integers forever" occasionally gets cut short by
   safety policy or weak instruction-following. Swap model or strategy.
-- **Parameter sets are guessed by fallback.** "OpenAI compatible" ranges from a
+- **Parameter sets are guessed by fallback**, and if a provider says "max_tokens
+  too large" or "context exceeded" the engine halves the offending number and
+  retries rather than failing the rest of the run. "OpenAI compatible" ranges from a
   byte-identical proxy to strict validation. The log's `v0`/`v1`/`v2` shows which
   variant finally worked.
 - **No Responses API support** yet.

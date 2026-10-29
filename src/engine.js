@@ -72,6 +72,7 @@ export class Burner extends EventEmitter {
 
     this.throttleUntil = 0;
     this.consecutive429 = 0;
+    this.limitAdjustments = 0;
 
     this.fillerCache = new Map();
     this.images = [];
@@ -347,15 +348,27 @@ export class Burner extends EventEmitter {
 
   #handleError(err, plan) {
     const s = this.stats;
-    s.requests++;
-    s.failed++;
     const msg = err?.message || String(err);
-    s.lastError = msg;
 
     if (err?.name === 'AbortError' || this.ac.signal.aborted) {
+      s.requests++;
+      s.failed++;
+      s.lastError = msg;
       if (this.state !== 'stopping') this.#log('warn', 'request aborted');
       return;
     }
+
+    // A 400 that says "too many tokens" is not a broken key, it is a catalog
+    // value that does not match this account's model. Shrink the offending
+    // number and retry instead of burning the rest of the run on failures.
+    if (this.#adaptLimits(msg)) {
+      this.#log('warn', `adjusting to provider limits: ctx ${this.model.ctx}, maxOut ${this.model.maxOut}`);
+      return;
+    }
+
+    s.requests++;
+    s.failed++;
+    s.lastError = msg;
 
     if (err?.status === 429) {
       this.consecutive429++;
@@ -373,6 +386,30 @@ export class Burner extends EventEmitter {
     }
 
     this.#log('error', `request failed: ${msg.slice(0, 300)}`);
+  }
+
+  /**
+   * Detect "your number is bigger than ours" 400s and shrink it.
+   * Bounded to a handful of adjustments so a genuinely broken config still
+   * surfaces as errors instead of looping forever.
+   */
+  #adaptLimits(msg) {
+    if (this.limitAdjustments++ > 6) return false;
+    const m = msg.toLowerCase();
+
+    const contextish = /context|too long|length limit|reduce the length|超过|过长/.test(m);
+    const outputish = /max_tokens|max_completion_tokens|maxoutputtokens|output token|maximum.*output|输出/.test(m);
+
+    if (contextish && this.model.ctx > 8192) {
+      this.model.ctx = Math.floor(this.model.ctx * 0.5);
+      this.fillerCache.clear();
+      return true;
+    }
+    if (outputish && this.model.maxOut > 512) {
+      this.model.maxOut = Math.floor(this.model.maxOut * 0.5);
+      return true;
+    }
+    return false;
   }
 
   #shouldStop() {

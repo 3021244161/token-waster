@@ -190,7 +190,7 @@ on response:
 - **金额上限是估算**。预扣用价格表算，实际以 `usage` 为准。如果价格表过时或图片 token 估低了，可能超出上限几个百分点（一个并发批次的量）。所以别把上限设成你钱包的极限。
 - **输出 token 无法精确控制**。`max_tokens` 是上限不是下限，模型可能提前收工。`mode: tokens` 用闭环补偿，但最后一个请求仍可能差几个百分点。
 - **有些模型会拒绝执行**。"无限输出整数"这类指令偶尔会被安全策略或指令遵循能力打断，表现为输出远小于 `max_tokens`。换模型或换策略。
-- **参数集靠回退猜**。所谓"OpenAI 兼容"从字节级代理到严格校验都有。第一次接新厂商时，前几个请求可能在试错（日志里 `v0`、`v1` 就是试到第几个变体）。
+- **参数集靠回退猜**。所谓"OpenAI 兼容"从字节级代理到严格校验都有。第一次接新厂商时，前几个请求可能在试错（日志里 `v0`、`v1` 就是试到第几个变体）。另外，如果服务商说"max_tokens 太大"或"上下文超了"，引擎会自动把对应数字减半重试，而不是一路失败到底。
 - **不支持 Responses API**。统一的入口是 Chat Completions；后续可能加。
 - **多轮上下文没做**。原因见上文：多轮会命中缓存，反而不浪费。
 
@@ -240,6 +240,7 @@ node scripts/selftest.js
   ✓ stop() halts in-flight workers
   ✓ anthropic protocol parses usage
   ✓ gemini protocol parses usage
+  ✓ oversized max_tokens is adapted, not retried forever
   ✓ dry run sends nothing and reports a plan
 ```
 
