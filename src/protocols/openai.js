@@ -79,6 +79,7 @@ export async function callOpenAI({
   effort,
   signal,
   timeoutMs,
+  streamIdleMs = 0,
   headers = {},
   path = '/chat/completions',
   authHeader = 'Authorization',
@@ -114,6 +115,7 @@ export async function callOpenAI({
 
       await readSse(res, {
         signal,
+        idleMs: streamIdleMs,
         onData: (ev) => {
           if (ev.usage) {
             absorbUsage(ev.usage, usage);

@@ -205,10 +205,28 @@
         <input id="confirmWord" type="text" autocomplete="off" spellcheck="false" placeholder="WASTE" />
       </div>
 
+      <div class="panel-actions">
       <button class="btn-ignite" id="ignite" disabled>
         <span class="ig-label">点火</span>
         <span class="ig-sub">开始之后，唯一的方向是停掉它</span>
       </button>
+
+      <button class="btn-drain" id="drain" disabled>
+        <span class="dr-t">无忧燃尽</span>
+        <span class="dr-s">不设目标 · 烧到服务商说余额不足为止</span>
+      </button>
+
+      <div class="drain-confirm" id="drainConfirm">
+        <div class="dc-head">真的要不设上限？</div>
+        <p>点下去之后，没有金额上限，没有 token 上限。它会一直发请求，直到服务商回一句「余额不足」，或者撞到下面这两个硬顶。</p>
+        <p class="dc-fine">硬顶：6 小时 · 20000 次请求 · 随时 Esc 可停。除此之外没有任何东西会拦它。</p>
+        <div class="dc-row">
+          <input id="drainWord" type="text" placeholder="输入 BURN" autocomplete="off" spellcheck="false" />
+          <button id="drainGo" disabled>确认燃尽</button>
+          <button id="drainCancel">算了</button>
+        </div>
+      </div>
+      </div>
     </div>
   </aside>
 
@@ -267,6 +285,10 @@
         <span class="kill-txt">停止焚烧</span>
       </button>
       <div class="kill-hint">按 <kbd>Esc</kbd> 也能停。停不下来就关掉终端。</div>
+      <button class="btn-report" id="report">
+        <span>导出一份燃烧报告</span>
+        <em>PDF · 含曲线、费用构成、事件日志</em>
+      </button>
     </div>
 
   </section>

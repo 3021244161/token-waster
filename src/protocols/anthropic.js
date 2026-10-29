@@ -36,6 +36,7 @@ export async function callAnthropic({
   thinkingBudget = 0,
   signal,
   timeoutMs,
+  streamIdleMs = 0,
   headers = {},
 }) {
   const url = joinUrl(baseUrl, '/v1/messages');
@@ -86,6 +87,7 @@ export async function callAnthropic({
       let thinkingChars = 0;
       await readSse(res, {
         signal,
+        idleMs: streamIdleMs,
         onData: (ev) => {
           if (ev.type === 'message_start') {
             const u = ev.message?.usage;

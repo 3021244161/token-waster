@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { PROVIDERS, CATALOG_VERSION, getProvider, getModel } from './src/config.js';
 import { Burner } from './src/engine.js';
 import { callProvider } from './src/protocols/index.js';
+import { renderReport } from './src/report.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -46,6 +47,8 @@ const MIME = {
 
 /** @type {{burner: Burner|null, sse: Set<import('node:http').ServerResponse>}} */
 const state = { burner: null, sse: new Set() };
+/** Guards the window between "request arrived" and "burner installed". */
+let starting = false;
 
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -102,7 +105,16 @@ function num(v, def, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
  * Every rejection here is a guard rail the user cannot click past.
  */
 function buildConfig(body) {
-  if (body?.confirm !== 'WASTE') {
+  const mode = ['tokens', 'usd', 'requests', 'time', 'drain'].includes(body.mode) ? body.mode : 'tokens';
+  const isDrain = mode === 'drain';
+
+  // 无忧燃尽 is the one mode whose whole purpose is to not stop, so it gets its
+  // own, louder confirmation word.
+  if (isDrain) {
+    if (body.confirm !== 'BURN') {
+      throw new BadRequest('「无忧燃尽」需要单独确认：请在确认框输入 BURN。');
+    }
+  } else if (body.confirm !== 'WASTE') {
     throw new BadRequest('未确认。请勾选"我明白我在花钱"并在确认框输入 WASTE。');
   }
 
@@ -135,7 +147,6 @@ function buildConfig(body) {
   const concurrency = num(body.concurrency, 4, { min: 1, max: HARD_MAX_CONCURRENCY });
 
   // ── target + guards. A run with no finite limit is refused outright.
-  const mode = ['tokens', 'usd', 'requests', 'time'].includes(body.mode) ? body.mode : 'tokens';
   const targetValue = num(body.targetValue, 0, { min: 0, max: 1e12 });
 
   const guard = body.guards || {};
@@ -153,11 +164,32 @@ function buildConfig(body) {
   if (mode === 'usd') limitUsd = targetValue;
   if (mode === 'requests') limitRequests = targetValue;
 
+  if (isDrain) {
+    // 无忧燃尽 has no money or token ceiling by definition — the provider's own
+    // "insufficient quota" response is what ends it. What it *does* keep is a
+    // wall-clock and request-count backstop, so a provider that happily serves
+    // forever (free tier, local model, forgotten PTU) cannot run until dawn.
+    limitTokens = Infinity;
+    limitUsd = Infinity;
+    limitRequests = maxRequests > 0 ? Math.min(maxRequests, HARD_MAX_REQUESTS) : HARD_MAX_REQUESTS;
+    limitDurationMs =
+      maxDurationSec > 0 ? Math.min(maxDurationSec * 1000, HARD_MAX_DURATION_MS) : HARD_MAX_DURATION_MS;
+  }
+
   // Guards always apply, whichever mode is active.
-  if (maxTokens > 0) limitTokens = Math.min(limitTokens, maxTokens);
-  if (maxUsd > 0) limitUsd = Math.min(limitUsd, maxUsd);
-  if (maxRequests > 0) limitRequests = Math.min(limitRequests, maxRequests);
-  if (maxDurationSec > 0) limitDurationMs = Math.min(limitDurationMs, maxDurationSec * 1000);
+  if (!isDrain) {
+    if (maxTokens > 0) limitTokens = Math.min(limitTokens, maxTokens);
+    if (maxUsd > 0) limitUsd = Math.min(limitUsd, maxUsd);
+    if (maxRequests > 0) limitRequests = Math.min(limitRequests, maxRequests);
+    if (maxDurationSec > 0) limitDurationMs = Math.min(limitDurationMs, maxDurationSec * 1000);
+  }
+
+  // The target field and the guard fields must not have different ceilings —
+  // otherwise `targetValue: 1000` reaches $1000 while the UI says the hard cap
+  // is $500.
+  if (Number.isFinite(limitUsd)) limitUsd = Math.min(limitUsd, HARD_MAX_USD);
+  if (Number.isFinite(limitRequests)) limitRequests = Math.min(limitRequests, HARD_MAX_REQUESTS);
+  if (Number.isFinite(limitDurationMs)) limitDurationMs = Math.min(limitDurationMs, HARD_MAX_DURATION_MS);
 
   const finite = [limitTokens, limitUsd, limitRequests, limitDurationMs].filter(Number.isFinite).length;
   if (finite === 0) {
@@ -173,6 +205,15 @@ function buildConfig(body) {
   }
   if (mode === 'tokens' && targetValue < 1000) throw new BadRequest('目标 token 数太小，至少要 1000');
 
+  // A zero price makes the money ceiling structurally inert: the local ledger
+  // computes $0 forever, so `maxUsd` never trips while the real meter runs.
+  const priceIsZero = model.price.in === 0 && model.price.out === 0;
+  if (priceIsZero && !Number.isFinite(limitDurationMs) && !Number.isFinite(limitRequests)) {
+    throw new BadRequest(
+      '这个模型的价格是 0（未填写或确实免费），金额上限永远不会触发。请改用「最多跑多少秒」或「最多请求数」兜底。',
+    );
+  }
+
   const strategy = ['max-output', 'image-bomb', 'mixed'].includes(body.strategy) ? body.strategy : 'max-output';
 
   const imageSize = num(body.imageSize, provider.imageLongEdge || 1536, { min: 256, max: 4096 });
@@ -181,6 +222,7 @@ function buildConfig(body) {
 
   const cfg = {
     providerId: provider.id,
+    providerLabel: provider.label,
     protocol: provider.protocol,
     baseUrl,
     apiVersion: provider.apiVersion,
@@ -188,7 +230,8 @@ function buildConfig(body) {
     modelId,
     model,
     strategy,
-    concurrency,
+    mode,
+    concurrency: isDrain && !body.concurrency ? 8 : concurrency,
     limitTokens,
     limitUsd,
     limitRequests,
@@ -202,6 +245,10 @@ function buildConfig(body) {
     effort: ['minimal', 'low', 'medium', 'high'].includes(body.effort) ? body.effort : null,
     thinkingBudget: num(body.thinkingBudget, 0, { min: 0, max: 200000 }),
     requestTimeoutMs: num(body.requestTimeoutMs, 180000, { min: 5000, max: 900000 }),
+    // A stream that goes quiet for this long is treated as dead and retried —
+    // one silently stalled socket would otherwise hold a worker hostage.
+    streamIdleMs: num(body.streamIdleMs, 75000, { min: 10000, max: 600000 }),
+    maxRetries: num(body.maxRetries, 2, { min: 0, max: 5 }),
     dryRun: !!body.dryRun,
   };
 
@@ -280,11 +327,23 @@ const routes = {
   },
 
   'POST /api/run/start': async (req, res) => {
+    // The exclusivity check has to survive the `await` below. Two bodies arriving
+    // in the same tick would otherwise both pass the check, the second would
+    // overwrite `state.burner`, and the first run would keep burning with no way
+    // to stop it from the UI.
+    if (starting) return json(res, 409, { error: '另一个运行正在启动中，稍等。' });
     if (state.burner && (state.burner.state === 'running' || state.burner.state === 'stopping')) {
       return json(res, 409, { error: '已经有一次运行在进行中，先停掉它。' });
     }
-    const body = await readJson(req);
-    const cfg = buildConfig(body);
+
+    starting = true;
+    let cfg;
+    try {
+      const body = await readJson(req);
+      cfg = buildConfig(body);
+    } finally {
+      starting = false;
+    }
 
     const burner = new Burner(cfg);
     state.burner = burner;
@@ -308,6 +367,23 @@ const routes = {
 
   'GET /api/run/logs': async (req, res) => {
     json(res, 200, { logs: state.burner?.logs?.slice(-200) || [] });
+  },
+
+  /**
+   * Printable run report. Served as HTML rather than a .pdf because the browser
+   * already has a PDF writer with the right fonts; see src/report.js.
+   * ?auto=1 opens the print dialog on load.
+   */
+  'GET /api/report': async (req, res) => {
+    if (!state.burner) return json(res, 404, { error: '还没有可导出的运行记录' });
+    const auto = /[?&]auto=1/.test(req.url || '');
+    const html = renderReport(state.burner.report(), { autoPrint: auto });
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+    res.end(html);
   },
 
   /** Single tiny request — verifies key/model/endpoint without burning much. */

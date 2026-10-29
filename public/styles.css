@@ -290,11 +290,14 @@ body {
 
 .panel {
   border-right: 1px solid var(--line);
-  padding: 22px 24px 40px;
+  padding: 22px 24px 0;
   position: sticky;
   top: 0;
-  max-height: 100vh;
+  /* Subtract the header height, otherwise the sticky action bar at the bottom
+     of this panel lands just below the viewport edge. */
+  max-height: calc(100vh - 69px);
   overflow-y: auto;
+  overscroll-behavior: contain;
   background: linear-gradient(180deg, rgba(8, 7, 10, 0.6), rgba(8, 7, 10, 0.9));
 }
 
@@ -544,6 +547,19 @@ details.adv > *:not(summary) { margin-bottom: 12px; }
 .confirm-word input { letter-spacing: 0.16em; color: var(--ember); }
 code { font-family: var(--mono); color: var(--ember); background: rgba(255, 138, 0, 0.1); padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
 
+/* Actions stay pinned to the bottom of the panel: the form above is long, and
+   hunting for the ignite button after filling it in is a bad way to spend
+   attention right before you set money on fire. */
+.panel-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
+  margin: 0 -24px;
+  padding: 14px 24px 12px;
+  background: linear-gradient(180deg, rgba(8, 7, 10, 0) 0%, rgba(8, 7, 10, 0.9) 16%, rgba(8, 7, 10, 0.99) 55%);
+  backdrop-filter: blur(3px);
+}
+
 .btn-ignite {
   width: 100%;
   margin-top: 6px;
@@ -568,6 +584,129 @@ code { font-family: var(--mono); color: var(--ember); background: rgba(255, 138,
 .btn-ignite .ig-sub { font-size: 9.5px; font-weight: 500; opacity: 0.55; letter-spacing: 0.1em; }
 .btn-ignite:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
 .btn-ignite:disabled { opacity: 0.25; cursor: not-allowed; transform: none; }
+
+/* ── drain mode ───────────────────────────────────────────────────────────── */
+
+.btn-drain {
+  width: 100%;
+  margin-top: 10px;
+  padding: 11px 12px;
+  border: 1px solid rgba(255, 45, 45, 0.3);
+  border-radius: 10px;
+  background: transparent;
+  color: #ff9a9a;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.btn-drain:hover:not(:disabled) {
+  background: rgba(255, 45, 45, 0.1);
+  border-color: rgba(255, 45, 45, 0.62);
+  color: #ffc4c4;
+}
+
+.btn-drain:disabled { opacity: 0.42; cursor: not-allowed; }
+.dr-t { font-size: 13px; font-weight: 800; letter-spacing: 0.14em; }
+.dr-s { font-size: 10px; opacity: 0.62; letter-spacing: 0.02em; }
+
+.drain-confirm {
+  display: none;
+  margin-top: 12px;
+  padding: 14px 14px 13px;
+  border: 1px solid rgba(255, 45, 45, 0.4);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(60, 10, 10, 0.7), rgba(30, 6, 6, 0.7));
+}
+
+.drain-confirm.open { display: block; }
+
+.dc-head {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #ff8b8b;
+  margin-bottom: 9px;
+}
+
+.drain-confirm p {
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  line-height: 1.62;
+  color: #cda9a9;
+}
+
+.dc-fine {
+  font-family: var(--mono);
+  font-size: 10.5px !important;
+  color: #967c7c !important;
+}
+
+.dc-row { display: flex; gap: 6px; margin-top: 10px; }
+
+.dc-row input {
+  flex: 1;
+  padding: 8px 10px;
+  background: #000;
+  border: 1px solid rgba(255, 45, 45, 0.28);
+  border-radius: 7px;
+  color: #ffb3b3;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  outline: none;
+  min-width: 0;
+}
+
+.dc-row input:focus { border-color: rgba(255, 45, 45, 0.7); }
+
+.dc-row button {
+  padding: 8px 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 45, 45, 0.4);
+  background: rgba(255, 45, 45, 0.14);
+  color: #ffb3b3;
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.dc-row button:hover:not(:disabled) { background: rgba(255, 45, 45, 0.26); }
+.dc-row button:disabled { opacity: 0.3; cursor: not-allowed; }
+#drainCancel { border-color: rgba(255, 255, 255, 0.12); background: transparent; color: var(--muted); }
+
+/* ── report button ────────────────────────────────────────────────────────── */
+
+.btn-report {
+  width: min(420px, 100%);
+  margin-top: 2px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--txt-2);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.btn-report:hover:not(:disabled) {
+  border-color: var(--line-hot);
+  color: var(--ember);
+  background: rgba(255, 138, 0, 0.05);
+}
+
+.btn-report:disabled { opacity: 0.35; cursor: not-allowed; }
+.btn-report span { font-size: 12px; font-family: var(--mono); letter-spacing: 0.1em; }
+.btn-report em { font-style: normal; font-size: 9.5px; color: var(--muted); letter-spacing: 0.04em; }
 
 /* ── stage ────────────────────────────────────────────────────────────────── */
 
@@ -815,6 +954,7 @@ kbd {
   .panel {
     position: relative;
     max-height: none;
+    padding-bottom: 8px;
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }

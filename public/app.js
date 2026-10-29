@@ -83,9 +83,13 @@ async function connectStream() {
 
   es.addEventListener('tick', (e) => applySnapshot(JSON.parse(e.data)));
   es.addEventListener('done', (e) => {
-    applySnapshot(JSON.parse(e.data));
+    const s = JSON.parse(e.data);
+    applySnapshot(s);
     setRunning(false);
-    toast(`烧完了 — ${reasonText(JSON.parse(e.data).stopReason)}`);
+    $('report').disabled = false;
+    toast(
+      `烧完了 — ${reasonText(s.stopReason)} · ${nf.format(s.total || 0)} token · $${(s.costUsd || 0).toFixed(2)}`,
+    );
   });
   es.addEventListener('log', (e) => appendLog(JSON.parse(e.data)));
 
@@ -173,14 +177,17 @@ function initGate() {
 /* ── form ─────────────────────────────────────────────────────────────────── */
 
 function validate() {
-  const ok =
+  const baseOk =
     $('agree').checked &&
-    $('confirmWord').value.trim().toUpperCase() === 'WASTE' &&
     $('apiKey').value.trim().length > 0 &&
     $('modelId').value.trim().length > 0 &&
     $('baseUrl').value.trim().length > 0;
 
-  $('ignite').disabled = !ok || state.running;
+  const confirmed = $('confirmWord').value.trim().toUpperCase() === 'WASTE';
+
+  $('ignite').disabled = !(baseOk && confirmed) || state.running;
+  // Drain does not need the WASTE word — it has its own, louder confirmation.
+  $('drain').disabled = !baseOk || state.running;
 }
 
 function readForm() {
@@ -196,9 +203,13 @@ function readForm() {
     maxDurationSec: numOr('maxDurationSec', 0),
     maxTokens: 0,
   };
-  // In "time" mode the target *is* the duration, so it has to reach the guard
-  // that the server actually enforces.
-  if (mode === 'time') guards.maxDurationSec = numOr('targetValue', 120);
+  // In "time" mode the target *is* a duration, so it has to reach the guard the
+  // server actually enforces — but it must not *overwrite* a stricter cap the
+  // user set by hand. Take the smaller of the two.
+  if (mode === 'time') {
+    const target = numOr('targetValue', 120);
+    guards.maxDurationSec = guards.maxDurationSec > 0 ? Math.min(guards.maxDurationSec, target) : target;
+  }
 
   return {
     providerId: $('provider').value,
@@ -230,11 +241,41 @@ function readForm() {
 
 async function ignite() {
   if (state.running) return;
-  const body = readForm();
+  await launch(readForm(), { drain: false });
+}
 
-  const btn = $('ignite');
+/**
+ * 无忧燃尽: no target, no money cap. The provider's "insufficient quota" reply is
+ * what ends this, which is why it needs its own confirmation word.
+ */
+async function startDrain() {
+  if (state.running) return;
+  const form = readForm();
+  const body = {
+    ...form,
+    mode: 'drain',
+    confirm: 'BURN',
+    // Pure output is the most expensive thing a model can do, so that is what
+    // "burn it all" means in practice.
+    strategy: 'max-output',
+    shortOutput: false,
+    concurrency: Math.max(8, Number($('concurrency').value) || 4),
+    // Zeros mean "no ceiling": the server substitutes its own hard stops
+    // (6h / 20k requests) because a run with no bound at all is refused.
+    guards: { maxUsd: 0, maxRequests: 0, maxDurationSec: 0, maxTokens: 0 },
+  };
+
+  closeDrainConfirm();
+  await launch(body, { drain: true });
+}
+
+async function launch(body, { drain = false } = {}) {
+  const btn = drain ? $('drain') : $('ignite');
+  const label = drain ? btn.querySelector('.dr-t') : btn.querySelector('.ig-label');
+  const original = label.textContent;
+
   btn.disabled = true;
-  btn.querySelector('.ig-label').textContent = '点火中…';
+  label.textContent = drain ? '点燃中…' : '点火中…';
 
   try {
     const res = await fetch('/api/run/start', {
@@ -246,14 +287,27 @@ async function ignite() {
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
     $('log').innerHTML = '';
-    state.display = { tokens: 0, usd: 0, tps: 0 };
-    state.target = { tokens: 0, usd: 0, tps: 0 };
+    state.display = { tokens: 0, input: 0, output: 0, cached: 0 };
+    state.target = { tokens: 0, input: 0, output: 0, cached: 0, tps: 0 };
     setRunning(true);
+    if (drain) toast('无忧燃尽已开始。它会一直跑到服务商拒绝为止。');
   } catch (err) {
     toast(err.message, true);
-    btn.querySelector('.ig-label').textContent = '点火';
+    label.textContent = original;
     validate();
   }
+}
+
+function closeDrainConfirm() {
+  $('drainConfirm').classList.remove('open');
+  $('drainWord').value = '';
+  $('drainGo').disabled = true;
+}
+
+async function openReport() {
+  if (!state.snap) return toast('还没有运行记录', true);
+  const w = window.open('/api/report?auto=1', '_blank');
+  if (!w) toast('浏览器拦截了新窗口，请允许弹窗后重试', true);
 }
 
 async function kill() {
@@ -273,10 +327,14 @@ function setRunning(on) {
 
   $('ignite').disabled = on;
   $('ignite').querySelector('.ig-label').textContent = on ? '正在烧' : '点火';
+  // The drain button keeps its label: two buttons reading "正在烧" is worse than
+  // one disabled button that still says what it would do.
+  $('drain').disabled = on;
   $('kill').disabled = !on;
   // Lock the form while a run is live: editing it would suggest the running job
   // could be changed, which it cannot.
   $('panelBody').inert = on;
+  if (!on) closeDrainConfirm();
   $('counter').classList.toggle('hot', on);
 
   if (!on) state.intensityTarget = 0;
@@ -299,7 +357,10 @@ function applySnapshot(s) {
   $('gUsd').innerHTML = `$${(s.usdPerMin || 0).toFixed(4)}<span>/min</span>`;
   $('gTps').innerHTML = `${nf.format(s.tokensPerSec || 0)}<span>/s</span>`;
   $('gCost').textContent = `$${(s.costUsd || 0).toFixed(4)}`;
-  $('gReq').innerHTML = `${nf.format(s.requests || 0)}<span> / ${nf.format(s.failed || 0)} 失败</span>`;
+  $('gReq').innerHTML =
+    `${nf.format(s.requests || 0)}<span> / ${nf.format(s.failed || 0)} 失败` +
+    `${s.permits ? ` · 并发 ${s.permits}` : ''}</span>`;
+  $('report').disabled = false;
 
   updateProgress(s);
 
@@ -328,7 +389,9 @@ function updateProgress(s) {
     label = '预算进度';
     fmt = (v) => `$${v.toFixed(4)}`;
   } else if (Number.isFinite(lim.requests) && lim.requests) {
-    value = s.requests || 0;
+    // The server counts every HTTP call against this ceiling, retries included,
+    // so show the same number it enforces.
+    value = s.wire ?? s.requests ?? 0;
     total = lim.requests;
     label = '请求进度';
     fmt = (v) => nf.format(Math.round(v));
@@ -574,6 +637,7 @@ function reasonText(r) {
   if (/request limit/.test(r)) return '达到请求数上限';
   if (/time limit/.test(r)) return '达到时长上限';
   if (/user/.test(r)) return '你按下了停止';
+  if (/account drained/.test(r)) return '账户已燃尽';
   if (/fatal/.test(r)) return `致命错误：${r.replace(/^fatal:\s*/, '')}`;
   return r;
 }
@@ -633,6 +697,26 @@ function bind() {
 
   $('ignite').addEventListener('click', ignite);
   $('kill').addEventListener('click', kill);
+  $('report').addEventListener('click', openReport);
+
+  $('drain').addEventListener('click', () => {
+    const box = $('drainConfirm');
+    const open = box.classList.toggle('open');
+    if (open) {
+      $('drainWord').value = '';
+      $('drainGo').disabled = true;
+      $('drainWord').focus();
+      box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  });
+  $('drainWord').addEventListener('input', (e) => {
+    $('drainGo').disabled = e.target.value.trim().toUpperCase() !== 'BURN';
+  });
+  $('drainWord').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !$('drainGo').disabled) startDrain();
+  });
+  $('drainGo').addEventListener('click', startDrain);
+  $('drainCancel').addEventListener('click', closeDrainConfirm);
   $('clearLog').addEventListener('click', () => {
     $('log').innerHTML = '<div class="row empty"><span class="m">清空了。</span></div>';
   });
@@ -687,6 +771,7 @@ bind();
 syncSliderLabels();
 $('strategyHint').textContent = STRATEGY_HINT['max-output'];
 $('log').innerHTML = '<div class="row empty"><span class="m">还没开始。</span></div>';
+$('report').disabled = true;
 resizeFire();
 requestAnimationFrame(drawFire);
 requestAnimationFrame(animateNumbers);

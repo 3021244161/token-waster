@@ -40,6 +40,7 @@ export async function callGemini({
   temperature = 1,
   signal,
   timeoutMs,
+  streamIdleMs = 0,
   headers = {},
 }) {
   const base = joinUrl(baseUrl, `/v1beta/models/${encodeURIComponent(model)}`);
@@ -83,6 +84,7 @@ export async function callGemini({
 
       await readSse(res, {
         signal,
+        idleMs: streamIdleMs,
         onData: (ev) => {
           if (ev.usageMetadata) absorb(ev.usageMetadata, usage);
           for (const c of ev?.candidates || []) {

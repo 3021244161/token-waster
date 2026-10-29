@@ -15,6 +15,7 @@ import { makeBlockPng, makeImagePool, estimateImageTokens } from '../src/images.
 import { buildPayload, makeFiller, estimateTokens, makeNonce } from '../src/prompts.js';
 import { Burner } from '../src/engine.js';
 import { estimateCostUsd } from '../src/config.js';
+import { renderReport } from '../src/report.js';
 
 const results = [];
 function test(name, fn) {
@@ -37,16 +38,82 @@ async function testAsync(name, fn) {
 /* ── mock vendor ──────────────────────────────────────────────────────────── */
 
 const MOCK_USAGE = { input: 1200, output: 2400 };
+let flakyHits = 0;
+/** Total HTTP calls the mock actually received, across every test. */
+let wireHits = 0;
 
 function startMock() {
   const server = http.createServer(async (req, res) => {
     const url = req.url || '';
     let raw = '';
     for await (const c of req) raw += c;
+    if (url.includes('/chat/completions') || url.includes('/messages') || url.includes('streamGenerateContent')) {
+      wireHits++;
+    }
 
     if (url.startsWith('/v1/chat/completions')) {
       const body = JSON.parse(raw);
       const maxOut = body.max_completion_tokens ?? body.max_tokens ?? 100;
+
+      // Dead account: the run should end cleanly with "account drained", not
+      // look like a crash.
+      if (body.model === 'drain-model') {
+        res.writeHead(402, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: { message: 'Insufficient quota: your credit balance is 0' } }));
+      }
+
+      // Permanently broken upstream, for the cooldown governor.
+      if (body.model === 'broken-model') {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: { message: 'upstream exploded' } }));
+      }
+
+      // Fails twice then works, for retry accounting.
+      if (body.model === 'flaky-model') {
+        flakyHits++;
+        if (flakyHits <= 2) {
+          res.writeHead(503, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ error: { message: 'temporarily unavailable' } }));
+        }
+      }
+
+      // Reports the *actual* size of what we sent, so tests can catch the engine
+      // silently inflating a small request into a 25k-token one.
+      if (body.model === 'echo-model') {
+        const txt = JSON.stringify(body.messages || []);
+        const inTok = estimateTokens(txt);
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [],
+            usage: { prompt_tokens: inTok, completion_tokens: 100, total_tokens: inTok + 100 },
+          })}\n\n`,
+        );
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+
+      // Streams text but omits usage entirely — the engine must not treat the
+      // missing input count as free.
+      if (body.model === 'plain-model') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'x'.repeat(4000) } }] })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+
+      // CRLF-framed SSE, as some proxies emit.
+      if (body.model === 'crlf-model') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'hello' } }] })}\r\n\r\n`);
+        res.write(
+          `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 500, completion_tokens: 600, total_tokens: 1100 } })}\r\n\r\n`,
+        );
+        res.write('data: [DONE]\r\n\r\n');
+        return res.end();
+      }
+
       // A fussy model that rejects oversized completions, to exercise the
       // engine's ability to shrink its own numbers instead of failing forever.
       if (body.model === 'picky-model' && maxOut > 4000) {
@@ -160,6 +227,33 @@ test('cost estimate uses per-1M pricing', () => {
   assert.equal(Math.round(usd), 35);
 });
 
+test('report renders totals and escapes untrusted strings', () => {
+  const html = renderReport({
+    snapshot: {
+      total: 1234567, input: 800000, output: 434567, cached: 0, costUsd: 12.34,
+      requests: 40, ok: 39, failed: 1, retries: 2, degraded: 1, recovered: 0,
+      elapsedMs: 65000, stopReason: 'token target reached', permits: 4,
+      peakInflight: 6, latency: { p50: 900, p90: 2000, p99: 3000 },
+      config: { concurrency: 8 }, estimateOnly: 0,
+    },
+    timeline: [
+      { t: 0, total: 0, cost: 0, rate: 0, req: 0 },
+      { t: 1000, total: 600000, cost: 6, rate: 600, req: 20 },
+      { t: 2000, total: 1234567, cost: 12.34, rate: 631, req: 40 },
+    ],
+    logs: [{ at: Date.now(), level: 'ok', msg: '+6,600 tok' }],
+    model: { id: 'test-model', ctx: 100000, maxOut: 8000, price: { in: 1, out: 2, currency: 'USD' } },
+    provider: { id: 'x', label: '<script>alert(1)</script>', baseUrl: 'https://x' },
+    startedAt: Date.now() - 65000,
+    endedAt: Date.now(),
+  });
+  assert.ok(html.startsWith('<!doctype html>'));
+  assert.ok(html.includes('1,234,567'), 'totals should be formatted');
+  assert.ok(html.includes('达到 token 目标'), 'stop reason should be translated');
+  assert.ok(!html.includes('<script>alert(1)</script>'), 'provider label must be escaped');
+  assert.ok(html.includes('&lt;script&gt;'));
+});
+
 /* ── engine integration ───────────────────────────────────────────────────── */
 
 function cfgFor(port, overrides = {}) {
@@ -185,6 +279,8 @@ function cfgFor(port, overrides = {}) {
     effort: null,
     thinkingBudget: 0,
     requestTimeoutMs: 10000,
+    streamIdleMs: 10000,
+    maxRetries: 2,
     dryRun: false,
     ...overrides,
   };
@@ -261,6 +357,78 @@ async function main() {
     const snap = await b.run();
     assert.ok(snap.ok > 0, 'should recover after shrinking max_tokens');
     assert.ok(b.logs.some((l) => /adjusting to provider limits/.test(l.msg)));
+  });
+
+  await testAsync('empty account ends the run as "drained", not as an error', async () => {
+    const b = new Burner(cfgFor(port, { modelId: 'drain-model', limitTokens: Infinity, limitRequests: 500 }));
+    const snap = await b.run();
+    assert.equal(snap.stopReason, 'account drained');
+    assert.ok(snap.elapsedMs < 8000, 'should give up quickly rather than retry a dead account');
+  });
+
+  await testAsync('transient 5xx is retried and eventually succeeds', async () => {
+    flakyHits = 0;
+    // The call ceiling counts wire calls now, so two failed attempts plus one
+    // success needs room for three.
+    const b = new Burner(cfgFor(port, { modelId: 'flaky-model', limitRequests: 6, maxRetries: 2 }));
+    const snap = await b.run();
+    assert.ok(snap.retries >= 2, `expected retries, got ${snap.retries}`);
+    assert.ok(snap.ok >= 1, 'should recover after the flaky window');
+  });
+
+  await testAsync('repeated failures shrink concurrency instead of hammering', async () => {
+    const b = new Burner(cfgFor(port, { modelId: 'broken-model', concurrency: 4, limitRequests: 6, maxRetries: 0 }));
+    await b.run();
+    assert.ok(b.stats.degraded > 0, 'governor should have cooled down');
+    assert.ok(b.permits < 4, `permits should shrink, got ${b.permits}`);
+  });
+
+  await testAsync('timeline is sampled and monotonic', async () => {
+    const b = new Burner(cfgFor(port, { limitTokens: 40000, limitDurationMs: 20000 }));
+    await b.run();
+    assert.ok(b.timeline.length > 0, 'report needs at least one point');
+    const last = b.timeline[b.timeline.length - 1];
+    assert.ok(last.total > 0);
+    assert.ok(last.t >= 0);
+  });
+
+  await testAsync('a small quota does not get inflated by the filler cache', async () => {
+    const b = new Burner(
+      cfgFor(port, { modelId: 'echo-model', limitTokens: 20000, limitRequests: 3, concurrency: 1, contextFill: 0.2 }),
+    );
+    const snap = await b.run();
+    assert.ok(snap.ok > 0);
+    const avgInput = snap.input / snap.ok;
+    // The plan wants ~16k input per request; the cache bucket is 25k. Before the
+    // trim, every request shipped 25k+ and blew the target.
+    assert.ok(avgInput < 20000, `input per request should stay near plan, got ${Math.round(avgInput)}`);
+    assert.ok(snap.total < 30000, `total should stay near the 20k target, got ${snap.total}`);
+  });
+
+  await testAsync('missing usage still charges the input we sent', async () => {
+    const b = new Burner(
+      cfgFor(port, { modelId: 'plain-model', limitTokens: 400000, limitRequests: 2, concurrency: 1 }),
+    );
+    const snap = await b.run();
+    assert.ok(snap.ok > 0);
+    assert.ok(snap.input > 1000, `input must not be zero when usage is absent, got ${snap.input}`);
+    assert.ok(snap.costUsd > 0, 'cost must not be zero when usage is absent');
+    assert.ok(snap.estimateOnly > 0, 'should be flagged as estimated');
+  });
+
+  await testAsync('retries cannot exceed the request ceiling', async () => {
+    flakyHits = 0;
+    wireHits = 0;
+    const b = new Burner(cfgFor(port, { modelId: 'flaky-model', limitRequests: 1, maxRetries: 3 }));
+    await b.run();
+    assert.equal(wireHits, 1, `upstream must see 1 call, saw ${wireHits}`);
+  });
+
+  await testAsync('CRLF-framed streams are parsed', async () => {
+    const b = new Burner(cfgFor(port, { modelId: 'crlf-model', limitRequests: 2 }));
+    const snap = await b.run();
+    assert.equal(snap.ok, 2);
+    assert.ok(snap.input >= 1000, `expected 500×2 input, got ${snap.input}`);
   });
 
   await testAsync('dry run sends nothing and reports a plan', async () => {

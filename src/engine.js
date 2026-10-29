@@ -2,7 +2,7 @@
  * The furnace.
  *
  * A Burner owns one run: a pool of workers that keep issuing requests until a
- * limit trips. Three things make it non-trivial:
+ * limit trips. The non-obvious parts:
  *
  *  1. *Pre-flight reservation.* With N workers in flight, "have we spent $5 yet"
  *     is only answerable if you reserve an estimate before each request and
@@ -16,6 +16,11 @@
  *  3. *Stopping must be immediate.* A single AbortController is shared by every
  *     in-flight request; `stop()` aborts it, and workers unwind on their next
  *     loop check.
+ *
+ *  4. *Throughput is a function of health, not of the concurrency setting.* A
+ *     provider that starts returning 500s does not get faster if you shout more
+ *     requests at it — so permits are dynamic (see #observe). The worker count is
+ *     the ceiling; the governor decides how many of them may be in flight.
  */
 
 import { EventEmitter } from 'node:events';
@@ -28,6 +33,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const FILLER_BUCKET = 25_000; // quantise filler sizes so we can reuse cached text
 const MAX_FILLER_CACHE = 6;
+const MAX_TIMELINE = 2400;
 
 export class Burner extends EventEmitter {
   constructor(cfg) {
@@ -45,6 +51,13 @@ export class Burner extends EventEmitter {
       requests: 0,
       ok: 0,
       failed: 0,
+      // Every HTTP call actually made, retries and parameter-variant probing
+      // included. This — not `requests` — is what the request ceiling counts,
+      // otherwise a retry budget triples the real call count for free.
+      wire: 0,
+      retries: 0,
+      degraded: 0,
+      recovered: 0,
       input: 0,
       output: 0,
       cached: 0,
@@ -74,11 +87,22 @@ export class Burner extends EventEmitter {
     this.consecutive429 = 0;
     this.limitAdjustments = 0;
 
+    // Throughput governor
+    this.permits = cfg.concurrency;
+    // Requests physically on the wire. Distinct from `inflight`, which counts
+    // *permits* — a worker waiting for budget still holds a permit.
+    this.sending = 0;
+    this.consecutiveFailures = 0;
+    this.successStreak = 0;
+
     this.fillerCache = new Map();
     this.images = [];
     this.imgPerImage = 0;
 
     this.samples = [];
+    this.timeline = [];
+    this.latencies = [];
+    this.lastSampleAt = 0;
     this.timer = null;
     this.logs = [];
   }
@@ -90,12 +114,17 @@ export class Burner extends EventEmitter {
     const elapsedMs = this.startedAt ? (this.endedAt || now) - this.startedAt : 0;
     const s = this.stats;
     const rate = this.#rate(now);
+    const attempted = s.ok + s.failed;
 
     return {
       state: this.state,
       stopReason: this.stopReason,
       elapsedMs,
       ...s,
+      permits: this.permits,
+      wire: s.wire,
+      successRate: attempted ? Number((s.ok / attempted).toFixed(3)) : 1,
+      latency: this.#latencyStats(),
       tokensPerSec: rate.tokensPerSec,
       requestsPerSec: rate.requestsPerSec,
       usdPerMin: rate.usdPerMin,
@@ -117,11 +146,30 @@ export class Burner extends EventEmitter {
         contextFill: this.cfg.contextFill,
         imageCount: this.cfg.imageCount,
         imageSize: this.cfg.imageSize,
+        mode: this.cfg.mode,
         mtokens: fin(this.limits.tokens),
       },
       // Committed = settled + promised to in-flight requests.
       committedTokens: s.total + this.reservedTokens,
       committedUsd: s.costUsd + this.reservedUsd,
+    };
+  }
+
+  /** Everything a report needs, without the API key. */
+  report() {
+    return {
+      snapshot: this.snapshot(),
+      timeline: this.timeline.slice(),
+      logs: this.logs.slice(-240),
+      model: {
+        id: this.cfg.modelId,
+        ctx: this.model.ctx,
+        maxOut: this.model.maxOut,
+        price: this.model.price,
+      },
+      provider: { id: this.cfg.providerId, label: this.cfg.providerLabel || this.cfg.providerId, baseUrl: this.cfg.baseUrl },
+      startedAt: this.startedAt,
+      endedAt: this.endedAt,
     };
   }
 
@@ -140,7 +188,15 @@ export class Burner extends EventEmitter {
   async run() {
     this.state = 'running';
     this.startedAt = Date.now();
-    this.timer = setInterval(() => this.emit('tick', this.snapshot()), 250);
+    this.lastSampleAt = this.startedAt;
+    this.timer = setInterval(() => this.#tick(), 250);
+
+    // A wall-clock deadline has to be independent of the worker loop: if every
+    // worker is parked inside a slow response, nothing else would ever notice
+    // that the run's time budget expired.
+    if (Number.isFinite(this.limits.ms) && this.limits.ms < 2 ** 31 - 1) {
+      this.deadlineTimer = setTimeout(() => this.stop('time limit reached'), this.limits.ms);
+    }
     this.#log('info', `target: ${describeLimits(this.limits)}`);
     this.#log('info', `model: ${this.cfg.modelId} (ctx ${this.model.ctx}, maxOut ${this.model.maxOut})`);
     this.#log('info', `strategy: ${this.cfg.strategy} · concurrency ${this.cfg.concurrency}`);
@@ -160,6 +216,8 @@ export class Burner extends EventEmitter {
       this.endedAt = Date.now();
       this.state = 'done';
       clearInterval(this.timer);
+      clearTimeout(this.deadlineTimer);
+      this.#sample(true);
       this.emit('tick', this.snapshot());
       this.emit('done', this.snapshot());
     }
@@ -170,69 +228,146 @@ export class Burner extends EventEmitter {
 
   async #worker(id) {
     while (!this.#shouldStop()) {
-      if (this.throttleUntil > Date.now()) {
-        await sleep(Math.min(5000, this.throttleUntil - Date.now()));
-        continue;
-      }
+      if (!(await this.#acquire())) return;
 
-      const plan = this.#plan();
-      if (!plan) {
-        // No plan usually means "the budget is fully reserved by requests that
-        // have not come back yet" — not that we are finished. Wait for a
-        // settlement to release the difference before deciding to stop.
-        if (this.stats.inflight > 0) {
-          await sleep(80);
+      try {
+        if (this.throttleUntil > Date.now()) {
+          await sleep(Math.min(5000, this.throttleUntil - Date.now()));
           continue;
         }
-        this.stop(this.#reasonForLimits());
-        return;
+
+        const plan = this.#plan();
+        if (!plan) {
+          // No plan usually means "the budget is fully reserved by requests that
+          // have not come back yet" — not that we are finished. Wait for a
+          // settlement to release the difference before deciding to stop.
+          // The test has to be on `sending`, not `inflight`: every waiting
+          // worker holds a permit, so `inflight` never drains and this would
+          // deadlock the moment the budget is exhausted.
+          if (this.sending > 0) {
+            await sleep(80);
+            continue;
+          }
+          this.stop(this.#reasonForLimits());
+          return;
+        }
+
+        // Reserve before dispatch so N workers cannot collectively blow past the cap.
+        this.reservedTokens += plan.estTokens;
+        this.reservedUsd += plan.estUsd;
+        this.reservedRequests += 1;
+
+        const t0 = Date.now();
+        this.sending++;
+        try {
+          const res = await this.#execute(plan);
+          this.#settle(plan, res, Date.now() - t0);
+        } catch (err) {
+          this.reservedTokens -= plan.estTokens;
+          this.reservedUsd -= plan.estUsd;
+          this.reservedRequests -= 1;
+          this.#handleError(err, plan);
+        } finally {
+          this.sending--;
+        }
+      } finally {
+        this.#release();
       }
+    }
+  }
 
-      // Reserve before dispatch so N workers cannot collectively blow past the cap.
-      this.reservedTokens += plan.estTokens;
-      this.reservedUsd += plan.estUsd;
-      this.reservedRequests += 1;
+  /**
+   * Send one request, retrying transient failures.
+   *
+   * Retries are deliberately short (250–750ms): the whole point of this tool is
+   * throughput, so a request that takes a second to retry has already cost more
+   * than the failed attempt saved. 429 is excluded on purpose — that needs a
+   * *global* pause, which the throttle handles, not one worker spinning.
+   */
+  async #execute(plan) {
+    const payload = buildPayload({
+      fillerTokens: plan.fillerTokens,
+      outputBias: plan.outputBias,
+      filler: plan.fillerTokens > 0 ? this.#fillerFor(plan.fillerTokens) : '',
+    });
+    const images = this.#pickImages(plan.imageCount);
+    const maxAttempts = Math.max(0, this.cfg.maxRetries ?? 2);
 
-      const t0 = Date.now();
-      this.stats.inflight++;
-      this.stats.peakInflight = Math.max(this.stats.peakInflight, this.stats.inflight);
+    let lastErr;
+    for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+      // Retries and parameter-variant fallbacks all pass through here, so this
+      // is the only place that can honestly enforce a call ceiling.
+      if (this.stats.wire >= this.limits.requests) {
+        const e = new Error('request budget exhausted');
+        e.budgetStop = true;
+        throw e;
+      }
+      this.stats.wire++;
 
-      let settled = false;
       try {
-        const payload = buildPayload({
-          fillerTokens: plan.fillerTokens,
-          outputBias: plan.outputBias,
-          filler: plan.fillerTokens > 0 ? this.#fillerFor(plan.fillerTokens) : '',
-        });
-
-        const res = await callProvider({
+        return await callProvider({
           protocol: this.cfg.protocol,
           baseUrl: this.cfg.baseUrl,
           apiKey: this.cfg.apiKey,
           model: this.cfg.modelId,
           apiVersion: this.cfg.apiVersion,
           payload,
-          images: this.#pickImages(plan.imageCount),
+          images,
           maxOutput: plan.maxOutput,
           effort: this.cfg.effort,
           thinkingBudget: this.cfg.thinkingBudget,
           signal: this.ac.signal,
           timeoutMs: this.cfg.requestTimeoutMs,
+          streamIdleMs: this.cfg.streamIdleMs,
         });
-
-        this.#settle(plan, res, Date.now() - t0);
-        settled = true;
       } catch (err) {
-        if (!settled) {
-          this.reservedTokens -= plan.estTokens;
-          this.reservedUsd -= plan.estUsd;
-          this.reservedRequests -= 1;
-        }
-        this.#handleError(err, plan);
-      } finally {
-        this.stats.inflight--;
+        lastErr = err;
+        if (this.ac.signal.aborted) throw err;
+        if (!this.#shouldRetry(err) || attempt === maxAttempts) throw err;
+
+        this.stats.retries++;
+        const wait = this.#retryDelay(err, attempt);
+        this.#log('warn', `retry ${attempt + 1}/${maxAttempts} in ${wait}ms — ${short(err.message)}`);
+        await sleep(wait);
+        if (this.ac.signal.aborted) throw err;
       }
     }
+    throw lastErr;
+  }
+
+  #shouldRetry(err) {
+    if (!err) return false;
+    if (err.drained) return false; // account is empty; retrying just wastes time
+    if (err.status === 429) return false; // global throttle owns this
+    if (err.fatal && !err.retryable) return false; // 401/403/404 will not heal
+    if (err.retryable) return true;
+    return err.name === 'StallError' || err.name === 'TypeError' || err.name === 'TimeoutError';
+  }
+
+  #retryDelay(err, attempt) {
+    if (err.retryAfterMs) return Math.min(err.retryAfterMs, 4000);
+    return Math.round(250 * 2 ** attempt + Math.random() * 250);
+  }
+
+  /**
+   * Concurrency permit. The worker count is the hard ceiling; this is the
+   * throttle the governor actually moves. Acquire is atomic because there is no
+   * await between the check and the increment.
+   */
+  async #acquire() {
+    while (!this.#shouldStop()) {
+      if (this.stats.inflight < this.permits) {
+        this.stats.inflight++;
+        this.stats.peakInflight = Math.max(this.stats.peakInflight, this.stats.inflight);
+        return true;
+      }
+      await sleep(40);
+    }
+    return false;
+  }
+
+  #release() {
+    this.stats.inflight = Math.max(0, this.stats.inflight - 1);
   }
 
   /* ── planning ───────────────────────────────────────────────────────────── */
@@ -246,24 +381,24 @@ export class Burner extends EventEmitter {
     const remUsd = this.limits.usd - this.stats.costUsd - this.reservedUsd;
 
     if (remTokens <= 512 || remUsd <= 0) return null;
-    if (this.stats.requests + this.reservedRequests >= this.limits.requests) return null;
+    if (this.stats.wire >= this.limits.requests) return null;
 
     const strategy = this.cfg.strategy;
     const wantImages = strategy === 'image-bomb' || strategy === 'mixed';
 
-    // ── how many images fit in this request?
+    // ── how many images fit? Bounded by the context window *and* by the budget
+    //    that is actually left — images are the one component the text scaler
+    //    cannot shrink, so they have to be sized before the text is.
     let imageCount = 0;
     if (wantImages && this.images.length > 0 && this.imgPerImage > 0) {
       const imgShare = strategy === 'image-bomb' ? this.cfg.imageShare : Math.min(0.35, this.cfg.imageShare);
-      const budgetForImages = Math.min(remTokens, ctx) * imgShare;
-      imageCount = Math.min(
-        this.images.length,
-        this.cfg.maxImagesPerRequest,
-        Math.max(0, Math.floor(budgetForImages / this.imgPerImage)),
-      );
+      const span = Math.min(remTokens, ctx);
+      const byShare = Math.floor((span * imgShare) / this.imgPerImage);
+      const byBudget = Math.floor((remTokens * 0.85) / this.imgPerImage);
+      imageCount = Math.min(this.images.length, this.cfg.maxImagesPerRequest, Math.max(0, byShare), Math.max(0, byBudget));
     }
 
-    const imgTokens = imageCount * this.imgPerImage;
+    let imgTokens = imageCount * this.imgPerImage;
 
     // ── text split: fill the context, then let the model write as much as it can.
     //    Capped because filler is generated as a JS string and uploaded as JSON:
@@ -277,20 +412,29 @@ export class Burner extends EventEmitter {
       inputTokens = Math.max(0, ctx - maxOutput - imgTokens);
     }
 
-    // ── scale to whatever budget is left (exact-quota behaviour falls out of this)
+    // ── scale the text to whatever is left after the images
     const wantTotal = inputTokens + maxOutput + imgTokens;
     if (wantTotal > remTokens) {
-      const k = remTokens / wantTotal;
+      const available = remTokens - imgTokens;
+      if (available < 512) return null; // images alone ate the budget
+      const flexible = Math.max(1, inputTokens + maxOutput);
+      const k = Math.min(1, available / flexible);
       inputTokens = Math.floor(inputTokens * k);
       maxOutput = Math.max(32, Math.floor(maxOutput * k));
     }
 
-    // ── respect the money ceiling
+    // ── respect the money ceiling; shrink images too, since text scaling alone
+    //    cannot bring a vision-heavy request under a dollar cap
     let estUsd = estimateCostUsd(model, { input: inputTokens + imgTokens, output: maxOutput });
     if (estUsd > remUsd) {
       const k = Math.max(0, remUsd / estUsd) * 0.98;
       inputTokens = Math.floor(inputTokens * k);
       maxOutput = Math.max(32, Math.floor(maxOutput * k));
+      const trimmed = Math.floor(imageCount * k);
+      if (trimmed < imageCount) {
+        imageCount = Math.max(0, trimmed);
+        imgTokens = imageCount * this.imgPerImage;
+      }
       estUsd = estimateCostUsd(model, { input: inputTokens + imgTokens, output: maxOutput });
     }
 
@@ -304,6 +448,11 @@ export class Burner extends EventEmitter {
       imageCount,
       fillerTokens,
       outputBias: this.cfg.shortOutput ? 'min' : 'max',
+      // What we believe we are sending. Used to settle the books when a vendor
+      // omits `usage` entirely — treating that case as "zero input" silently
+      // gave away the entire prompt cost.
+      estInput: inputTokens + imgTokens,
+      estOutput: maxOutput,
       // Reservation carries a safety margin: if our token estimate is low (a
       // vision model billing more than the formula predicted), the overshoot is
       // absorbed here rather than showing up as an unbudgeted charge.
@@ -314,10 +463,16 @@ export class Burner extends EventEmitter {
 
   #settle(plan, res, latencyMs) {
     const u = res.usage || {};
-    const actualTokens = u.total || (u.input || 0) + (u.output || 0);
+    // When the vendor omits `usage`, the adapters can only guess the output from
+    // the text it received — the input side has to come from what we sent. Left
+    // at zero it quietly refunded the entire prompt cost of every un-metered
+    // request, which is exactly the number that matters most here.
+    const inTok = u.input || (u.reported ? 0 : plan.estInput || 0);
+    const outTok = u.output || 0;
+    const actualTokens = u.total || inTok + outTok;
     const actualUsd = estimateCostUsd(this.model, {
-      input: u.input || 0,
-      output: u.output || 0,
+      input: inTok,
+      output: outTok,
       cached: u.cached || 0,
     });
 
@@ -328,8 +483,8 @@ export class Burner extends EventEmitter {
     const s = this.stats;
     s.requests++;
     s.ok++;
-    s.input += u.input || 0;
-    s.output += u.output || 0;
+    s.input += inTok;
+    s.output += outTok;
     s.cached += u.cached || 0;
     s.reasoning += u.reasoning || 0;
     s.total += actualTokens;
@@ -338,10 +493,11 @@ export class Burner extends EventEmitter {
 
     this.samples.push({ t: Date.now(), tokens: actualTokens, usd: actualUsd, req: 1 });
     this.consecutive429 = 0;
+    this.#observe(true, latencyMs);
 
     this.#log(
       'ok',
-      `+${fmt(actualTokens)} tok (in ${fmt(u.input || 0)} / out ${fmt(u.output || 0)}` +
+      `+${fmt(actualTokens)} tok (in ${fmt(inTok)} / out ${fmt(outTok)}` +
         `${u.cached ? ` / cached ${fmt(u.cached)}` : ''}) · $${actualUsd.toFixed(4)} · ${latencyMs}ms · v${res.variant}`,
     );
   }
@@ -349,6 +505,10 @@ export class Burner extends EventEmitter {
   #handleError(err, plan) {
     const s = this.stats;
     const msg = err?.message || String(err);
+
+    // Not a failure: the worker just discovered the call ceiling from below.
+    // The next #plan() returns null and the run winds down normally.
+    if (err?.budgetStop) return;
 
     if (err?.name === 'AbortError' || this.ac.signal.aborted) {
       s.requests++;
@@ -369,6 +529,15 @@ export class Burner extends EventEmitter {
     s.requests++;
     s.failed++;
     s.lastError = msg;
+    this.#observe(false);
+
+    if (err?.drained) {
+      // 无忧燃尽 ends here, and this is a success state, not an error.
+      this.stopReason = 'account drained';
+      this.#log('error', `账户已燃尽 — ${short(msg, 200)}`);
+      this.stop('account drained');
+      return;
+    }
 
     if (err?.status === 429) {
       this.consecutive429++;
@@ -385,7 +554,51 @@ export class Burner extends EventEmitter {
       return;
     }
 
-    this.#log('error', `request failed: ${msg.slice(0, 300)}`);
+    this.#log('error', `request failed: ${short(msg, 300)}`);
+  }
+
+  /**
+   * Throughput governor.
+   *
+   * Two straight failures halve the permits; five in a row trip a short circuit
+   * breaker. Twelve clean requests in a row buy one permit back. The point is
+   * that a degraded provider makes the tool quieter, not slower-but-louder —
+   * hammering a 500ing endpoint just multiplies wasted requests.
+   */
+  #observe(ok, latencyMs = 0) {
+    if (ok) {
+      this.consecutiveFailures = 0;
+      this.successStreak++;
+      if (latencyMs) {
+        this.latencies.push(latencyMs);
+        if (this.latencies.length > 200) this.latencies.shift();
+      }
+
+      if (this.successStreak % 12 === 0 && this.permits < this.cfg.concurrency) {
+        this.permits++;
+        this.stats.recovered++;
+        this.#log('info', `recovering concurrency → ${this.permits}`);
+      }
+      return;
+    }
+
+    this.successStreak = 0;
+    this.consecutiveFailures++;
+
+    if (this.consecutiveFailures >= 2 && this.permits > 1) {
+      const next = Math.max(1, Math.floor(this.permits / 2));
+      if (next < this.permits) {
+        this.permits = next;
+        this.stats.degraded++;
+        this.#log('warn', `cooling down: concurrency → ${this.permits} (${this.consecutiveFailures} straight failures)`);
+      }
+    }
+
+    if (this.consecutiveFailures >= 5) {
+      const pause = Math.min(15_000, 2000 * (this.consecutiveFailures - 4));
+      this.throttleUntil = Math.max(this.throttleUntil, Date.now() + pause);
+      this.#log('warn', `circuit open — pausing ${Math.round(pause / 1000)}s`);
+    }
   }
 
   /**
@@ -427,7 +640,7 @@ export class Burner extends EventEmitter {
     if (s.total + this.reservedTokens >= this.limits.tokens) return 'token target reached';
     if (s.costUsd + this.reservedUsd >= this.limits.usd) return 'budget reached';
     if (s.requests + this.reservedRequests >= this.limits.requests) return 'request limit reached';
-    return 'limits reached';
+    return 'run complete';
   }
 
   /* ── assets ─────────────────────────────────────────────────────────────── */
@@ -466,15 +679,27 @@ export class Burner extends EventEmitter {
   }
 
   #fillerFor(tokens) {
-    const bucket = Math.round(tokens / FILLER_BUCKET) * FILLER_BUCKET;
-    const key = Math.max(FILLER_BUCKET, bucket);
-    const hit = this.fillerCache.get(key);
-    if (hit) return hit;
+    if (tokens <= 0) return '';
 
-    const text = makeFiller(key);
-    this.fillerCache.set(key, text);
-    if (this.fillerCache.size > MAX_FILLER_CACHE) {
-      this.fillerCache.delete(this.fillerCache.keys().next().value);
+    // Bucket upwards so a 1k request can still reuse a cached 25k blob, then
+    // trim to what this request actually planned. Handing over the whole bucket
+    // was a 25× overshoot on small quotas — it blew both the token target and the
+    // context window.
+    const key = Math.max(FILLER_BUCKET, Math.ceil(tokens / FILLER_BUCKET) * FILLER_BUCKET);
+    let text = this.fillerCache.get(key);
+
+    if (!text) {
+      text = makeFiller(key);
+      this.fillerCache.set(key, text);
+      if (this.fillerCache.size > MAX_FILLER_CACHE) {
+        this.fillerCache.delete(this.fillerCache.keys().next().value);
+      }
+    }
+
+    if (key > tokens * 1.02) {
+      const ratio = tokens / key;
+      const cut = Math.max(200, Math.floor(text.length * ratio));
+      return text.slice(0, cut);
     }
     return text;
   }
@@ -505,7 +730,44 @@ export class Burner extends EventEmitter {
     this.state = 'done';
   }
 
-  /* ── misc ───────────────────────────────────────────────────────────────── */
+  /* ── telemetry ──────────────────────────────────────────────────────────── */
+
+  #tick() {
+    this.#sample(false);
+    this.emit('tick', this.snapshot());
+  }
+
+  /** One point per second, at most MAX_TIMELINE points (decimated when full). */
+  #sample(force) {
+    const now = Date.now();
+    if (!force && now - this.lastSampleAt < 1000) return;
+    this.lastSampleAt = now;
+    if (!this.startedAt) return;
+
+    const s = this.stats;
+    this.timeline.push({
+      t: now - this.startedAt,
+      total: s.total,
+      input: s.input,
+      output: s.output,
+      cost: Number(s.costUsd.toFixed(6)),
+      req: s.requests,
+      rate: this.#rate(now).tokensPerSec,
+    });
+
+    if (this.timeline.length > MAX_TIMELINE) {
+      // Keep every other point: halves resolution, doubles the window.
+      this.timeline = this.timeline.filter((_, i) => i % 2 === 0);
+    }
+  }
+
+  #latencyStats() {
+    if (this.latencies.length === 0) return { p50: 0, p90: 0, p99: 0, avg: 0 };
+    const sorted = this.latencies.slice().sort((a, b) => a - b);
+    const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+    const avg = Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length);
+    return { p50: at(0.5), p90: at(0.9), p99: at(0.99), avg };
+  }
 
   #rate(now) {
     const windowMs = 5000;
@@ -524,7 +786,7 @@ export class Burner extends EventEmitter {
   #log(level, msg) {
     const entry = { at: Date.now(), level, msg };
     this.logs.push(entry);
-    if (this.logs.length > 300) this.logs.shift();
+    if (this.logs.length > 400) this.logs.shift();
     this.emit('log', entry);
   }
 }
@@ -537,6 +799,11 @@ function fmt(n) {
 
 function fin(n) {
   return Number.isFinite(n) ? n : null;
+}
+
+function short(s, n = 140) {
+  const t = String(s || '').replace(/\s+/g, ' ');
+  return t.length > n ? `${t.slice(0, n)}…` : t;
 }
 
 function describeLimits(l) {

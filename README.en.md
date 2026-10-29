@@ -132,6 +132,56 @@ Empirically `mode: tokens` converges within ±5% of the target.
 
 ---
 
+## Burn until empty
+
+For when you don't want to pick a number, you just want to watch the account go to zero.
+
+1. Fill in provider and key
+2. Hit **无忧燃尽** (the red one under Ignite)
+3. Type `BURN`
+
+It switches to max-output, raises concurrency to at least 8, and keeps going until the provider
+answers `insufficient quota` / `402` / a localised equivalent. That is a clean finish, not a crash
+— the report's stop reason reads "account drained".
+
+The only brakes are a 6-hour and 20,000-request backstop, hard-coded server-side, because a run
+with genuinely no bound at all is refused. Nothing else will stop it.
+
+> It won't actually blow up your card — the provider gives up first. Unless you have auto-recharge
+> enabled, in which case all bets are off.
+
+## Run report
+
+Hit **导出一份燃烧报告** at any point (mid-run is fine). A print-styled A4 page opens and the print
+dialog appears; choose "Save as PDF".
+
+The report contains totals, a cost breakdown by token type, cumulative and instantaneous throughput
+charts, run-quality metrics (stop reason, peak concurrency, 429s, cooldown events, P50/P90/P99
+latency), the last 70 log lines, and a note about which numbers are estimates.
+
+**Why not emit a .pdf directly**: a Chinese-language PDF requires an embedded CJK font — either
+megabytes of font data or a headless browser, both of which break the zero-dependency promise. The
+browser's own print pipeline produces the same artefact, with vector charts and selectable text.
+
+## Staying fast when the provider misbehaves
+
+Three things, because a degraded upstream is the main way a burn tool quietly loses throughput:
+
+**Per-request retry.** Network errors, 5xx and stalled streams get up to 2 more attempts with
+250–750 ms backoff. The goal is throughput: a retry that waits a second has already cost more than
+it saves.
+
+**Stall detection.** The real throughput killer isn't an error, it's a socket that stays open and
+stops sending. One such request holds a worker until the 180 s timeout while everyone else races
+ahead, and your effective rate silently halves. 75 seconds of silence now aborts and retries.
+
+**Cooldown instead of shouting.** Two straight failures halve the concurrency permits; five trip a
+2–15 s global breaker; twelve clean requests buy a permit back. Adding pressure to a 500ing endpoint
+only multiplies wasted requests. The "并发" figure in the UI is the *current permit count*, not the
+slider value.
+
+---
+
 ## Providers
 
 Three wire protocols cover everything: OpenAI Chat Completions, Anthropic
@@ -174,6 +224,8 @@ card declines" and is refused.
 6. API keys never enter logs or error messages.
 7. One shared `AbortController` for every in-flight request; `Esc` stops the run.
 8. 429s trigger global exponential backoff rather than hammering your quota.
+9. Burn-until-empty drops the money and token ceilings but keeps the 6h / 20k-request backstop,
+   and demands its own confirmation word.
 
 ## Known limitations
 
@@ -201,7 +253,19 @@ node scripts/selftest.js
 
 Spins up a mock vendor speaking all three protocols and drives the real engine
 against it: usage accounting, quota convergence, money/request cutoffs, abort,
-PNG size, prefix randomness. 15 tests, no network, no key.
+PNG size, prefix randomness. 25 tests, no network, no key.
+
+## Review record
+
+`docs/issues/` holds a 14-item review of this code from 2026-10-29 (11 of them P1), each with
+repro steps, root cause, fix and acceptance criteria. All are closed, and 11 gained regression
+tests. The highlights are worth reading if you plan to change the scheduler:
+
+- the filler cache's 25k bucket made small quotas send 25× the planned input
+- a vendor that omits `usage` had its entire prompt cost refunded
+- retries and variant probing did not count against the request ceiling
+- `for await` locks a stream, so the stall detector could not actually cancel anything
+- the start-exclusivity check sat before an `await`, so two concurrent submissions both won
 
 ## Structure
 
