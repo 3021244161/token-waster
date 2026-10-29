@@ -54,7 +54,7 @@ that the operator is the key's owner.
 Node.js ≥ 20. **Zero dependencies**, no install step.
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/3021244161/token-waster.git
 cd token-waster
 node server.js
 ```

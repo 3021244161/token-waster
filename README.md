@@ -54,7 +54,7 @@
 需要 Node.js ≥ 20。**零依赖**，没有 npm install 步骤。
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/3021244161/token-waster.git
 cd token-waster
 node server.js
 ```
