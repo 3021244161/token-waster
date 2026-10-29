@@ -1,0 +1,25 @@
+{
+  "name": "token-waster",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Deliberately incinerate your own LLM tokens. A satirical load generator for API burn-rate benchmarking.",
+  "keywords": [
+    "llm",
+    "token",
+    "burn-rate",
+    "load-testing",
+    "satire"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "selftest": "node scripts/selftest.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>token-waster — 把 token 烧给你看</title>
+<meta name="description" content="A satirical load generator that incinerates your own LLM tokens and shows you the receipt." />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔥</text></svg>" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+
+<canvas id="fire" aria-hidden="true"></canvas>
+<div class="vignette" aria-hidden="true"></div>
+
+<!-- ══ 使用前声明 ═══════════════════════════════════════════════════════ -->
+<div class="gate" id="gate">
+  <div class="gate-inner">
+    <div class="gate-kicker">BEFORE YOU PRESS ANYTHING</div>
+    <h1>这台机器只会烧钱。</h1>
+    <div class="gate-body" id="gateBody">
+      <p><strong>它不产出任何东西。</strong>没有文案、没有代码、没有图片。模型输出的每一个 token 都会被立刻丢弃。你付钱，换回一个变大的数字。</p>
+      <p><strong>只对你自己的账号使用。</strong>你需要自备 API key，费用从你自己的账单里扣。这个项目不会、也不能替你付钱。</p>
+      <p><strong>key 只活在这个进程的内存里。</strong>不写磁盘、不进日志、不上传任何地方。刷新页面就没了，重启服务就没了。请勿在公用电脑上使用。</p>
+      <p><strong>费用可能超出你的预期。</strong>工具会在启动前强制要求你设一个硬上限（金额 / token / 请求数 / 时长四选一以上），达到上限立即熔断。但估算价格表可能过时，实际账单以服务商为准。</p>
+      <p><strong>不要用它绕过任何配额或条款。</strong>部分服务商禁止自动化滥用行为。你对自己的账号行为负责——包括被限流、被降级、被封禁。</p>
+      <p><strong>如果你不确定自己在做什么，请关掉这个页面。</strong>这不是一个需要"试一试"的东西。</p>
+      <p class="gate-fine">本项目是讽刺性的工程玩具，用于观察 API 计费行为与限流机制。作者不对任何账单、账号状态或数据损失负责。MIT License，无任何担保。</p>
+    </div>
+
+    <label class="gate-check">
+      <input type="checkbox" id="gateAgree" />
+      <span>我读完了，我知道这会花我自己的钱，我为自己的账号负责。</span>
+    </label>
+
+    <div class="gate-confirm">
+      <label for="gateWord">输入 <code>WASTE</code> 继续</label>
+      <input id="gateWord" type="text" autocomplete="off" spellcheck="false" placeholder="WASTE" />
+    </div>
+
+    <button class="btn-enter" id="gateEnter" disabled>进入焚化炉</button>
+    <div class="gate-note">仅监听 127.0.0.1 · 不联网除你指定的 API 端点</div>
+  </div>
+</div>
+
+<!-- ══ 主体 ═════════════════════════════════════════════════════════════ -->
+<header class="top">
+  <div class="brand">
+    <span class="brand-flame">🔥</span>
+    <span class="brand-name">TOKEN<span>WASTER</span></span>
+    <span class="brand-ver" id="ver">v0.1</span>
+  </div>
+  <div class="top-right">
+    <div class="status" id="status"><i></i><span>待机</span></div>
+  </div>
+</header>
+
+<main class="shell">
+
+  <!-- 左：配置 -->
+  <aside class="panel" id="panel">
+    <div class="panel-head">
+      <h2>装填</h2>
+      <button class="mini" id="collapse" title="折叠">–</button>
+    </div>
+
+    <div class="panel-body" id="panelBody">
+
+      <div class="field">
+        <label for="provider">服务商</label>
+        <select id="provider"></select>
+        <div class="hint" id="providerHint"></div>
+      </div>
+
+      <div class="field">
+        <label for="baseUrl">Base URL</label>
+        <input id="baseUrl" type="text" spellcheck="false" />
+      </div>
+
+      <div class="field">
+        <label for="apiKey">API Key <em>只存在内存</em></label>
+        <div class="key-row">
+          <input id="apiKey" type="password" spellcheck="false" autocomplete="off" placeholder="sk-..." />
+          <button class="mini" id="toggleKey" title="显示/隐藏">👁</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="modelId">模型 ID</label>
+        <input id="modelId" type="text" list="modelList" spellcheck="false" />
+        <datalist id="modelList"></datalist>
+        <div class="hint" id="modelHint"></div>
+      </div>
+
+      <div class="field-row">
+        <button class="btn-ghost" id="probe">发一个最小请求验证</button>
+        <span class="probe-out" id="probeOut"></span>
+      </div>
+
+      <details class="adv">
+        <summary>模型限制 · 覆盖内置值</summary>
+        <div class="field-row three">
+          <div class="field"><label for="ctx">上下文</label><input id="ctx" type="number" min="4096" step="1024" /></div>
+          <div class="field"><label for="maxOut">最大输出</label><input id="maxOut" type="number" min="32" step="1024" /></div>
+          <div class="field"><label for="currency">计价</label>
+            <select id="currency"><option>USD</option><option>CNY</option></select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label for="priceIn">输入 $/1M</label><input id="priceIn" type="number" min="0" step="0.01" /></div>
+          <div class="field"><label for="priceOut">输出 $/1M</label><input id="priceOut" type="number" min="0" step="0.01" /></div>
+        </div>
+        <div class="hint">内置价格表核对于 2026-10，可能已过时。以服务商账单为准。</div>
+      </details>
+
+      <hr />
+
+      <div class="field">
+        <label>烧法</label>
+        <div class="seg" id="strategy">
+          <button data-v="max-output" class="on">狂输出</button>
+          <button data-v="image-bomb">大图轰炸</button>
+          <button data-v="mixed">双管齐下</button>
+        </div>
+        <div class="hint" id="strategyHint"></div>
+      </div>
+
+      <div class="field">
+        <label for="mode">烧到哪儿停</label>
+        <select id="mode">
+          <option value="tokens">固定 token 数（闭环校准）</option>
+          <option value="usd">固定金额</option>
+          <option value="requests">固定请求数</option>
+          <option value="time">固定时长</option>
+        </select>
+      </div>
+
+      <div class="field target-row">
+        <label for="targetValue" id="targetLabel">目标 token</label>
+        <input id="targetValue" type="number" min="1000" step="1000" value="1000000" />
+        <div class="presets" id="presets">
+          <button data-v="100000">100K</button>
+          <button data-v="1000000">1M</button>
+          <button data-v="10000000">10M</button>
+          <button data-v="100000000">100M</button>
+        </div>
+      </div>
+
+      <details class="adv" open>
+        <summary>硬上限（至少一项，不可关闭）</summary>
+        <div class="field-row three">
+          <div class="field"><label for="maxUsd">最多花 $</label><input id="maxUsd" type="number" min="0" step="0.5" value="2" /></div>
+          <div class="field"><label for="maxRequests">最多请求</label><input id="maxRequests" type="number" min="0" step="10" value="200" /></div>
+          <div class="field"><label for="maxDurationSec">最多秒</label><input id="maxDurationSec" type="number" min="0" step="30" value="180" /></div>
+        </div>
+        <div class="hint">四个上限同时生效，先到先停。留 0 表示该维度不设限。</div>
+      </details>
+
+      <div class="field">
+        <label for="concurrency">并发 <b id="concVal">4</b></label>
+        <input id="concurrency" type="range" min="1" max="32" step="1" value="4" />
+        <div class="hint">越高越可能撞 429；撞到会自动退避，不会硬冲。</div>
+      </div>
+
+      <details class="adv">
+        <summary>更狠的旋钮</summary>
+        <div class="field">
+          <label for="contextFill">输入填充率 <b id="fillVal">25%</b></label>
+          <input id="contextFill" type="range" min="0" max="95" step="5" value="25" />
+          <div class="hint">输入 token 便宜但量大：拉高 → token 总数涨得快；拉低 → 烧钱更快。</div>
+        </div>
+        <div class="field">
+          <label for="imageCount">图片张数 <b id="imgVal">4</b></label>
+          <input id="imageCount" type="range" min="0" max="32" step="1" value="4" />
+        </div>
+        <div class="field">
+          <label for="imageSize">图片边长 <b id="sizeVal">1536</b>px</label>
+          <input id="imageSize" type="range" min="256" max="4096" step="256" value="1536" />
+          <div class="hint">用低熵色块 PNG：文件几十 KB，计费按像素。上传很轻，账单很重。</div>
+        </div>
+        <div class="field">
+          <label for="effort">推理强度</label>
+          <select id="effort">
+            <option value="">不传（用模型默认）</option>
+            <option value="minimal">minimal</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high（思考 token 按输出计费）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="thinkingBudget">Anthropic thinking 预算 <b id="thinkVal">0</b></label>
+          <input id="thinkingBudget" type="range" min="0" max="32000" step="1024" value="0" />
+        </div>
+        <label class="check"><input type="checkbox" id="shortOutput" /><span>只要极短输出（纯输入消耗）</span></label>
+      </details>
+
+      <label class="check confirm">
+        <input type="checkbox" id="agree" />
+        <span>我确认这是我的 key，且我知道这会把钱烧掉。</span>
+      </label>
+
+      <div class="field confirm-word">
+        <label for="confirmWord">输入 <code>WASTE</code> 解锁</label>
+        <input id="confirmWord" type="text" autocomplete="off" spellcheck="false" placeholder="WASTE" />
+      </div>
+
+      <button class="btn-ignite" id="ignite" disabled>
+        <span class="ig-label">点火</span>
+        <span class="ig-sub">开始之后，唯一的方向是停掉它</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- 右：舞台 -->
+  <section class="stage">
+
+    <div class="counter-wrap">
+      <div class="counter-label">TOKENS INCINERATED</div>
+      <div class="counter" id="counter">0</div>
+      <div class="counter-sub">
+        <span id="counterIn">in 0</span>
+        <span class="dot">/</span>
+        <span id="counterOut">out 0</span>
+        <span class="dot">/</span>
+        <span id="counterCached">cached 0</span>
+      </div>
+    </div>
+
+    <div class="gauges">
+      <div class="gauge">
+        <div class="g-label">烧钱速度</div>
+        <div class="g-val" id="gUsd">$0.0000<span>/min</span></div>
+      </div>
+      <div class="gauge">
+        <div class="g-label">token 流速</div>
+        <div class="g-val" id="gTps">0<span>/s</span></div>
+      </div>
+      <div class="gauge">
+        <div class="g-label">累计花费</div>
+        <div class="g-val" id="gCost">$0.0000</div>
+      </div>
+      <div class="gauge">
+        <div class="g-label">请求 / 失败</div>
+        <div class="g-val" id="gReq">0<span>/0</span></div>
+      </div>
+    </div>
+
+    <div class="progress-wrap">
+      <div class="p-head"><span id="pLabel">进度</span><span id="pText">—</span></div>
+      <div class="p-bar"><div class="p-fill" id="pFill"></div></div>
+    </div>
+
+    <div class="log-wrap">
+      <div class="log-head">
+        <span>焚化日志</span>
+        <span class="log-tools">
+          <button class="mini" id="clearLog">清空</button>
+        </span>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+
+    <div class="kill-wrap">
+      <button class="kill" id="kill" disabled>
+        <span class="kill-ring"></span>
+        <span class="kill-txt">停止焚烧</span>
+      </button>
+      <div class="kill-hint">按 <kbd>Esc</kbd> 也能停。停不下来就关掉终端。</div>
+    </div>
+
+  </section>
+</main>
+
+<footer class="foot">
+  <span>讽刺性工程玩具 · 不产出任何内容 · MIT License</span>
+  <span id="footCat"></span>
+</footer>
+
+<div class="toast" id="toast"></div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
