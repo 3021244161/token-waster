@@ -63,6 +63,32 @@ function scrub(text) {
     .replace(/\s+/g, ' ');
 }
 
+/**
+ * Is this 400/422 a complaint about the *shape* of the request (a field name the
+ * endpoint does not know) or about a *value* in it?
+ *
+ * Only shape errors are worth retrying with a different parameter set. Getting
+ * this wrong in the permissive direction is expensive: a "max_tokens is too
+ * large" reply would trigger four variant probes that all fail the same way, and
+ * on a tight call budget those probes are the whole budget — the engine never
+ * even sees the error it needs in order to shrink the number.
+ */
+export function isShapeError(err) {
+  if (!(err instanceof ApiError)) return false;
+  if (err.status !== 400 && err.status !== 422) return false;
+
+  const b = String(err.body ?? '').toLowerCase();
+  if (/model.*(not found|does not exist|not exist|invalid)|unknown model/.test(b)) return false;
+
+  // A value that is too big is not a field-name problem: resending the same
+  // number under another name cannot help.
+  if (/too (large|long|big|many)|exceed|maximum|out of range/.test(b)) return false;
+
+  return /unsupported|unknown (field|parameter|argument)|unrecognized|unexpected|extra (field|inputs|for key)|invalid[_ ]?(request|parameter|value)|not allowed|only supports|cannot be used/.test(
+    b,
+  );
+}
+
 export function joinUrl(base, path) {
   return `${base.replace(/\/+$/, '')}${path}`;
 }
@@ -174,12 +200,18 @@ export function emptyUsage() {
   return { input: 0, output: 0, cached: 0, reasoning: 0, total: 0, reported: false };
 }
 
-export function finalizeUsage(u, fallbackText = '') {
-  if (!u.reported && fallbackText) {
+/**
+ * @param {object} u          normalised usage
+ * @param {number} textLength characters of completion received (never the text)
+ */
+export function finalizeUsage(u, textLength = 0) {
+  if (!u.reported && textLength) {
     // Only used when a vendor omits usage entirely; rough and clearly labelled.
-    u.output = Math.max(u.output, Math.ceil(fallbackText.length / 3.6));
-    u.total = u.input + u.output;
+    u.output = Math.max(u.output, Math.ceil(textLength / 3.6));
   }
-  if (!u.total) u.total = u.input + u.output;
+  // Deliberately leave `total` at 0 when it was not reported: the engine fills in
+  // the input side it knows we sent, and a fabricated total here would win over
+  // that and under-count the request.
+  if (u.reported && !u.total) u.total = u.input + u.output;
   return u;
 }

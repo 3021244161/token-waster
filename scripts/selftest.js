@@ -9,6 +9,7 @@
  */
 
 import http from 'node:http';
+import zlib from 'node:zlib';
 import assert from 'node:assert/strict';
 
 import { makeBlockPng, makeImagePool, estimateImageTokens } from '../src/images.js';
@@ -16,6 +17,7 @@ import { buildPayload, makeFiller, estimateTokens, makeNonce } from '../src/prom
 import { Burner } from '../src/engine.js';
 import { estimateCostUsd } from '../src/config.js';
 import { renderReport } from '../src/report.js';
+import { callProvider } from '../src/protocols/index.js';
 
 const results = [];
 function test(name, fn) {
@@ -41,6 +43,7 @@ const MOCK_USAGE = { input: 1200, output: 2400 };
 let flakyHits = 0;
 /** Total HTTP calls the mock actually received, across every test. */
 let wireHits = 0;
+let periodicHits = 0;
 
 function startMock() {
   const server = http.createServer(async (req, res) => {
@@ -75,6 +78,45 @@ function startMock() {
           res.writeHead(503, { 'content-type': 'application/json' });
           return res.end(JSON.stringify({ error: { message: 'temporarily unavailable' } }));
         }
+      }
+
+      // Only accepts the second parameter variant, so we can prove the scheduler
+      // remembers it instead of re-probing two dead shapes on every call.
+      if (body.model === 'variant-model') {
+        if (body.max_completion_tokens !== undefined) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ error: { message: 'Unsupported parameter: max_completion_tokens' } }));
+        }
+      }
+
+      // Latency proportional to the requested output, which is how real decoders
+      // behave — the case where coarse per-request quotas cripple concurrency.
+      if (body.model === 'slow-model') {
+        const out = Math.min(maxOut, 2000);
+        await new Promise((r) => setTimeout(r, out / 10));
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'x' } }] })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 100, completion_tokens: out, total_tokens: 100 + out } })}\n\n`,
+        );
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+
+      // Fails the first four calls, then one in ten forever: never twelve
+      // consecutive successes, so a streak-based recovery would never fire.
+      if (body.model === 'flaky10') {
+        periodicHits++;
+        if (periodicHits <= 4 || periodicHits % 10 === 1) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ error: { message: 'transient upstream error' } }));
+        }
+      }
+
+      // Asks for a long wait, for the cancellable-sleep test.
+      if (body.model === 'ratelimit-model') {
+        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' });
+        return res.end(JSON.stringify({ error: { message: 'rate limit exceeded' } }));
       }
 
       // Reports the *actual* size of what we sent, so tests can catch the engine
@@ -190,6 +232,38 @@ test('image pool yields distinct images', () => {
   assert.equal(pool.length, 3);
   const hashes = new Set(pool.map((p) => p.base64.slice(0, 256)));
   assert.equal(hashes.size, 3);
+});
+
+test('PNG blocks decode back to flat colour', () => {
+  // Guards the Up-filter bug: subtracting the *already filtered* previous row
+  // left every block striped, which still decoded without error.
+  const size = 256;
+  const img = makeBlockPng(size, size, { seed: 7 });
+
+  const chunks = [];
+  let o = 8;
+  while (o < img.buffer.length) {
+    const len = img.buffer.readUInt32BE(o);
+    const type = img.buffer.toString('ascii', o + 4, o + 8);
+    chunks.push({ type, data: img.buffer.subarray(o + 8, o + 8 + len) });
+    o += 12 + len;
+  }
+  const idat = chunks.find((c) => c.type === 'IDAT');
+  assert.ok(idat, 'IDAT present');
+
+  const raw = zlib.inflateSync(idat.data);
+  const stride = size * 3 + 1;
+  assert.equal(raw[0], 2, 'first scanline uses the Up filter');
+  assert.equal(raw[stride], 2, 'second scanline uses the Up filter');
+
+  // Block width is max(16, round(256/24)) = 16 px, so the first 14 columns of row
+  // 1 sit inside the same block as row 0 and must encode as a zero delta.
+  for (let x = 0; x < 14; x++) {
+    const i = stride + 1 + x * 3;
+    assert.equal(raw[i], 0, `red delta at x=${x}`);
+    assert.equal(raw[i + 1], 0, `green delta at x=${x}`);
+    assert.equal(raw[i + 2], 0, `blue delta at x=${x}`);
+  }
 });
 
 test('image token estimates are per-protocol', () => {
@@ -353,7 +427,11 @@ async function main() {
   });
 
   await testAsync('oversized max_tokens is adapted, not retried forever', async () => {
-    const b = new Burner(cfgFor(port, { modelId: 'picky-model', limitRequests: 4 }));
+    // Generous budget so the planner does not trim max_tokens below the point
+    // where the mock's "too large" rejection would fire.
+    // Probing four parameter variants costs four wire calls, and the ceiling now
+    // counts those — so leave room for the probe plus the successful retry.
+    const b = new Burner(cfgFor(port, { modelId: 'picky-model', limitRequests: 12, limitTokens: 400000 }));
     const snap = await b.run();
     assert.ok(snap.ok > 0, 'should recover after shrinking max_tokens');
     assert.ok(b.logs.some((l) => /adjusting to provider limits/.test(l.msg)));
@@ -414,6 +492,9 @@ async function main() {
     assert.ok(snap.input > 1000, `input must not be zero when usage is absent, got ${snap.input}`);
     assert.ok(snap.costUsd > 0, 'cost must not be zero when usage is absent');
     assert.ok(snap.estimateOnly > 0, 'should be flagged as estimated');
+    // The total must agree with its own components; a partial reported total used
+    // to win and left `total` at a fraction of `input + output`.
+    assert.equal(snap.total, snap.input + snap.output, `total ${snap.total} != ${snap.input}+${snap.output}`);
   });
 
   await testAsync('retries cannot exceed the request ceiling', async () => {
@@ -429,6 +510,73 @@ async function main() {
     const snap = await b.run();
     assert.equal(snap.ok, 2);
     assert.ok(snap.input >= 1000, `expected 500×2 input, got ${snap.input}`);
+  });
+
+  await testAsync('the working parameter variant is remembered, not re-probed', async () => {
+    wireHits = 0;
+    const b = new Burner(cfgFor(port, { modelId: 'variant-model', limitRequests: 40, concurrency: 1, limitTokens: 2000000 }));
+    const snap = await b.run();
+    assert.ok(snap.ok >= 5, `expected several calls, got ${snap.ok}`);
+    // 1 probe (2 calls) + 1 call each afterwards. Without the memory it would be
+    // 2 calls every time.
+    assert.ok(wireHits <= snap.ok + 3, `${wireHits} wire calls for ${snap.ok} successes — variant not reused`);
+    assert.ok(b.variantProfile !== null, 'variant should be recorded');
+  });
+
+  await testAsync('quota is split per slot so concurrency actually opens up', async () => {
+    const b = new Burner(
+      cfgFor(port, {
+        modelId: 'slow-model',
+        concurrency: 8,
+        limitTokens: 16000,
+        limitRequests: 500,
+        contextFill: 0.05,
+        model: { id: 'slow', ctx: 200000, maxOut: 8000, price: { in: 1, out: 2, currency: 'USD' }, vision: true },
+      }),
+    );
+    const snap = await b.run();
+    // Before the split, the first two plans reserved the whole 16k and the other
+    // six workers starved: peak concurrency sat at 2.
+    assert.ok(snap.peakInflight >= 5, `peak concurrency was only ${snap.peakInflight}`);
+  });
+
+  await testAsync('periodic failures still let concurrency recover', async () => {
+    periodicHits = 0;
+    const b = new Burner(
+      cfgFor(port, { modelId: 'flaky10', concurrency: 4, limitRequests: 60, maxRetries: 0, limitTokens: 5000000 }),
+    );
+    await b.run();
+    assert.ok(b.stats.recovered > 0, 'rolling-window recovery never fired');
+    assert.ok(b.permits > 1, `permits stuck at ${b.permits}`);
+  });
+
+  await testAsync('a long Retry-After can be interrupted by stop()', async () => {
+    const b = new Burner(cfgFor(port, { modelId: 'ratelimit-model', limitRequests: 50, limitDurationMs: 60000 }));
+    const started = Date.now();
+    const p = b.run();
+    await new Promise((r) => setTimeout(r, 300));
+    b.stop('test');
+    const snap = await p;
+    // The mock asks for 60 s. A plain setTimeout would keep the run (and the UI)
+    // in "stopping" for the whole minute.
+    assert.ok(Date.now() - started < 3000, `stop took ${Date.now() - started}ms`);
+    assert.equal(snap.state, 'done');
+  });
+
+  await testAsync('adapter reports a length instead of keeping the completion', async () => {
+    const out = await callProvider({
+      protocol: 'openai-chat',
+      baseUrl: `http://127.0.0.1:${port}/v1`,
+      apiKey: 'k',
+      model: 'plain-model',
+      payload: { system: 's', filler: '', instruction: 'go' },
+      images: [],
+      maxOutput: 100,
+      timeoutMs: 8000,
+    });
+    assert.ok(!('text' in out), 'completion text must not be retained');
+    assert.ok(out.textLength > 1000, `expected a character count, got ${out.textLength}`);
+    assert.ok(out.sample.length <= 200, 'sample must stay bounded');
   });
 
   await testAsync('dry run sends nothing and reports a plan', async () => {

@@ -100,32 +100,48 @@ export function makeBlockPng(width, height, { seed = crypto.randomInt(2 ** 31), 
 
   const stride = w * 3 + 1; // +1 for the per-scanline filter byte
   const raw = Buffer.alloc(stride * h);
-  let prevRowStart = -1;
+
+  // The Up filter subtracts the *previous scanline's original bytes*. Reading
+  // them back out of `raw` would read the already-filtered deltas — which is a
+  // bug that survives decoding (the image still opens) but corrupts every block
+  // into horizontal stripes and roughly triples the file size. Keep a clean copy.
+  let prevRow = Buffer.alloc(w * 3);
+  let curRow = Buffer.alloc(w * 3);
 
   for (let y = 0; y < h; y++) {
     const rowStart = y * stride;
     raw[rowStart] = 2; // filter: Up (each byte minus the byte directly above)
     const by = Math.min(rows - 1, (y / blockPx) | 0);
+    const first = y === 0;
 
     for (let x = 0; x < w; x++) {
       const bx = Math.min(cols - 1, (x / blockPx) | 0);
       const pi = (by * cols + bx) * 3;
       const o = rowStart + 1 + x * 3;
-      const up = prevRowStart < 0 ? 0 : raw[prevRowStart + 1 + x * 3];
-      const up1 = prevRowStart < 0 ? 0 : raw[prevRowStart + 2 + x * 3];
-      const up2 = prevRowStart < 0 ? 0 : raw[prevRowStart + 3 + x * 3];
+      const p = x * 3;
 
-      raw[o] = palette[pi];
-      raw[o + 1] = palette[pi + 1];
-      raw[o + 2] = palette[pi + 2];
+      const r = palette[pi];
+      const g = palette[pi + 1];
+      const b = palette[pi + 2];
 
-      if (prevRowStart >= 0) {
-        raw[o] = (raw[o] - up) & 0xff;
-        raw[o + 1] = (raw[o + 1] - up1) & 0xff;
-        raw[o + 2] = (raw[o + 2] - up2) & 0xff;
+      if (first) {
+        raw[o] = r;
+        raw[o + 1] = g;
+        raw[o + 2] = b;
+      } else {
+        raw[o] = (r - prevRow[p]) & 0xff;
+        raw[o + 1] = (g - prevRow[p + 1]) & 0xff;
+        raw[o + 2] = (b - prevRow[p + 2]) & 0xff;
       }
+
+      curRow[p] = r;
+      curRow[p + 1] = g;
+      curRow[p + 2] = b;
     }
-    prevRowStart = rowStart;
+
+    const swap = prevRow;
+    prevRow = curRow;
+    curRow = swap;
   }
 
   const ihdr = Buffer.alloc(13);
@@ -144,10 +160,11 @@ export function makeBlockPng(width, height, { seed = crypto.randomInt(2 ** 31), 
     chunk('IEND', Buffer.alloc(0)),
   ]);
 
+  const base64 = png.toString('base64');
   return {
     buffer: png,
-    base64: png.toString('base64'),
-    dataUrl: `data:image/png;base64,${png.toString('base64')}`,
+    base64,
+    dataUrl: `data:image/png;base64,${base64}`,
     width: w,
     height: h,
     bytes: png.length,
@@ -165,6 +182,30 @@ export function makeImagePool(count, size, { seedBase = crypto.randomInt(2 ** 31
   const out = [];
   for (let i = 0; i < n; i++) {
     out.push(makeBlockPng(size, size, { seed: (seedBase + i * 7919) >>> 0 }));
+  }
+  return out;
+}
+
+/**
+ * Same thing, but yields to the event loop between images.
+ *
+ * Encoding a 4096² PNG is ~300 ms of solid synchronous work, so a pool of them
+ * froze the HTTP thread for over a second: /api/run/stop and the run's own
+ * deadline could not be served during that window. Interleaving setImmediate
+ * costs nothing and makes the tool answer immediately.
+ *
+ * @param {(done: number, total: number) => void} [onProgress]
+ * @param {AbortSignal} [signal] stop early if the run is cancelled
+ */
+export async function makeImagePoolAsync(count, size, { seedBase = crypto.randomInt(2 ** 31), onProgress, signal } = {}) {
+  const n = Math.max(0, Math.min(32, Math.floor(count)));
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    if (signal?.aborted) break;
+    // Let queued I/O (a stop request, a status poll) run first.
+    await new Promise((r) => setImmediate(r));
+    out.push(makeBlockPng(size, size, { seed: (seedBase + i * 7919) >>> 0 }));
+    onProgress?.(i + 1, n);
   }
   return out;
 }

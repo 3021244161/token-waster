@@ -176,7 +176,20 @@ stops sending. One such request holds a worker until the 180 s timeout while eve
 ahead, and your effective rate silently halves. 75 seconds of silence now aborts and retries.
 
 **Cooldown instead of shouting.** Two straight failures halve the concurrency permits; five trip a
-2–15 s global breaker; twelve clean requests buy a permit back. Adding pressure to a 500ing endpoint
+2–15 s global breaker. Recovery keys off a rolling 20-request success rate (≥80%, 3 s cooldown)
+rather than a streak — a provider that fails one request in ten never produces twelve consecutive
+successes, and a streak rule would leave concurrency pinned at 1 forever.
+
+**Parameter negotiation happens once.** The tool probes a few shapes on first contact
+(`max_completion_tokens` vs `max_tokens`, streaming vs not) and remembers which one worked, so it
+does not re-upload the same large body twice per call. It also separates "unknown field" from
+"value too large": the former changes shape, the latter makes the scheduler halve the number
+instead of battering the same wall four times. Every real request — probes and retries included —
+counts against the call ceiling.
+
+**Quota is split per slot.** With 8 concurrent workers and a 16k target, planning each request at
+"model max + all remaining budget" lets the first two eat everything and the other six idle. The
+budget is now divided by the live permit count, so a small target still runs genuinely parallel. Adding pressure to a 500ing endpoint
 only multiplies wasted requests. The "并发" figure in the UI is the *current permit count*, not the
 slider value.
 
@@ -253,7 +266,7 @@ node scripts/selftest.js
 
 Spins up a mock vendor speaking all three protocols and drives the real engine
 against it: usage accounting, quota convergence, money/request cutoffs, abort,
-PNG size, prefix randomness. 25 tests, no network, no key.
+PNG size, prefix randomness. 31 tests, no network, no key.
 
 ## Review record
 

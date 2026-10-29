@@ -4,11 +4,19 @@
  * The clones are the reason this file is defensive: "OpenAI compatible" ranges
  * from a byte-identical proxy to an endpoint that rejects any field it has not
  * heard of. So instead of guessing the right parameter set we ship an ordered
- * list of variants and walk down it on 4xx, which costs at most a handful of
- * wasted calls the first time you point the tool at a new vendor.
+ * list of variants and walk down it on 4xx.
+ *
+ * Two details that matter for a burn tool:
+ *  - Completion text is *counted*, not accumulated. Nothing downstream reads it;
+ *    keeping a megabyte of output alive per worker is pure GC pressure.
+ *  - The variant that worked is returned so the scheduler can try it first next
+ *    time. Re-discovering it on every request means uploading the same large body
+ *    two extra times per call, which on a slow link dominates everything.
  */
 
-import { postJson, readSse, joinUrl, ApiError, emptyUsage, finalizeUsage } from './http.js';
+import { postJson, readSse, joinUrl, emptyUsage, finalizeUsage, isShapeError } from './http.js';
+
+const SAMPLE_CHARS = 160;
 
 function contentParts(payload, images) {
   const parts = [{ type: 'text', text: payload.filler }];
@@ -60,13 +68,31 @@ function buildVariants({ model, payload, images, maxOutput, effort }) {
   return out;
 }
 
-/** Errors that mean "this request shape is wrong", not "this account is broken". */
-function isShapeError(err) {
-  if (!(err instanceof ApiError)) return false;
-  if (err.status !== 400 && err.status !== 422) return false;
-  const b = String(err.body || '');
-  if (/model.*(not found|does not exist|not exist|invalid)|unknown model/i.test(b)) return false;
-  return true;
+/** Try the remembered variant first, then everything else in order. */
+export function orderVariants(count, preferred) {
+  const order = [];
+  if (Number.isInteger(preferred) && preferred >= 0 && preferred < count) order.push(preferred);
+  for (let i = 0; i < count; i++) if (i !== preferred) order.push(i);
+  return order;
+}
+
+/** Accumulates a bounded sample plus a character count, never the full text. */
+export function makeSink() {
+  let chars = 0;
+  let sample = '';
+  return {
+    push(s) {
+      if (!s) return;
+      chars += s.length;
+      if (sample.length < SAMPLE_CHARS) sample += s.slice(0, SAMPLE_CHARS - sample.length);
+    },
+    get chars() {
+      return chars;
+    },
+    get sample() {
+      return sample;
+    },
+  };
 }
 
 export async function callOpenAI({
@@ -85,19 +111,27 @@ export async function callOpenAI({
   authHeader = 'Authorization',
   authPrefix = 'Bearer ',
   extraQuery = '',
+  preferredVariant = null,
+  beforeSend = null,
 }) {
   const url = joinUrl(baseUrl, path) + extraQuery;
   const variants = buildVariants({ model, payload, images, maxOutput, effort });
+  const order = orderVariants(variants.length, preferredVariant);
 
   let lastErr;
-  for (let i = 0; i < variants.length; i++) {
-    const body = variants[i];
+  let shapeErr = null;
+  for (let n = 0; n < order.length; n++) {
+    const vi = order[n];
+    const body = variants[vi];
     const usage = emptyUsage();
-    // Chunks are collected in an array rather than string-concatenated: a
-    // 128K-token completion arrives as thousands of deltas and repeated `+=`
-    // on a half-megabyte string is quadratic.
-    const chunks = [];
+    const sink = makeSink();
+    const more = n < order.length - 1;
+
     try {
+      // Counts against the call ceiling at the only place that knows a request is
+      // really leaving the machine — including variant probing.
+      beforeSend?.();
+
       const res = await postJson(url, {
         headers: { [authHeader]: `${authPrefix}${apiKey}`, ...headers },
         body,
@@ -108,9 +142,9 @@ export async function callOpenAI({
       if (body.stream === false) {
         const json = await res.json();
         absorbUsage(json.usage, usage);
-        const text = json?.choices?.[0]?.message?.content || '';
+        sink.push(json?.choices?.[0]?.message?.content || '');
         usage.reported = !!json.usage;
-        return { usage: finalizeUsage(usage, text), text, variant: i };
+        return { usage: finalizeUsage(usage, sink.chars), textLength: sink.chars, sample: sink.sample, variant: vi };
       }
 
       await readSse(res, {
@@ -122,16 +156,24 @@ export async function callOpenAI({
             usage.reported = true;
           }
           const delta = ev?.choices?.[0]?.delta;
-          if (delta?.content) chunks.push(delta.content);
-          if (delta?.reasoning_content) chunks.push(delta.reasoning_content);
+          if (delta?.content) sink.push(delta.content);
+          if (delta?.reasoning_content) sink.push(delta.reasoning_content);
         },
       });
 
-      const text = chunks.join('');
-      return { usage: finalizeUsage(usage, text), text, variant: i };
+      return { usage: finalizeUsage(usage, sink.chars), textLength: sink.chars, sample: sink.sample, variant: vi };
     } catch (err) {
       lastErr = err;
-      if (isShapeError(err) && i < variants.length - 1) continue;
+      if (err?.budgetStop) {
+        // Ran out of call budget mid-probe. Surface the shape error if we saw one,
+        // otherwise the engine learns nothing and keeps the wrong parameters.
+        if (shapeErr) throw shapeErr;
+        throw err;
+      }
+      if (isShapeError(err) && more) {
+        shapeErr = err;
+        continue;
+      }
       throw err;
     }
   }
