@@ -162,7 +162,9 @@ Plus MiniMax, xAI, Groq, Mistral, SiliconFlow as templates.
 
 ## Guard rails (enforced, not suggested)
 
-1. A run with **no finite limit** is rejected with HTTP 400.
+1. A run with **no finite limit** is rejected with HTTP 400 — and money or
+duration must be among them. A token target alone is effectively "run until the
+card declines" and is refused.
 2. Hard caps: concurrency 32, $500/run, 20,000 requests/run, 6 hours/run.
 3. Binds `127.0.0.1` only.
 4. Cross-origin requests refused; all writes require `application/json`

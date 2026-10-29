@@ -153,7 +153,7 @@
           <div class="field"><label for="maxRequests">最多请求</label><input id="maxRequests" type="number" min="0" step="10" value="200" /></div>
           <div class="field"><label for="maxDurationSec">最多秒</label><input id="maxDurationSec" type="number" min="0" step="30" value="180" /></div>
         </div>
-        <div class="hint">四个上限同时生效，先到先停。留 0 表示该维度不设限。</div>
+        <div class="hint">四个上限同时生效，先到先停，留 0 表示该维度不设限。但「最多花 $」和「最多秒」至少要填一个 —— 服务端不接受没有金额或时长兜底的运行。</div>
       </details>
 
       <div class="field">

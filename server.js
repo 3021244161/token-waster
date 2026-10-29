@@ -165,6 +165,12 @@ function buildConfig(body) {
       '拒绝启动：没有任何硬上限。请至少设置一个（token 数 / 金额 / 请求数 / 时长）。这不是可以关掉的开关。',
     );
   }
+  // A token or request target alone is not enough: token counts are enormous
+  // numbers and a 1e12 target is effectively "run until your card declines".
+  // Money and time are the two limits a person can actually reason about.
+  if (!Number.isFinite(limitUsd) && !Number.isFinite(limitDurationMs)) {
+    throw new BadRequest('拒绝启动：必须至少设置「最多花多少美元」或「最多跑多少秒」其中之一，给账单和时长留个兜底。');
+  }
   if (mode === 'tokens' && targetValue < 1000) throw new BadRequest('目标 token 数太小，至少要 1000');
 
   const strategy = ['max-output', 'image-bomb', 'mixed'].includes(body.strategy) ? body.strategy : 'max-output';
