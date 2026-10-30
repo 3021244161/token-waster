@@ -46,7 +46,7 @@ scripts/selftest.js  离线测试，自带 mock 厂商
 4. **不要为了"更好看"牺牲可读性。** 火焰是背景，日志和停止按钮必须绝对清晰。
    Canvas 用 `mix-blend-mode: screen` + 低 opacity，永远不要盖在文字上。
 5. **不要把服务绑到 `0.0.0.0`。**
-6. 改完跑 `node scripts/selftest.js`，全部通过再提交（当前 46 项）。
+6. 改完跑 `node scripts/selftest.js`，全部通过再提交（当前 60 项）。
 
 ## 三个容易改坏的地方
 
@@ -84,6 +84,10 @@ Anthropic 会把长边压到 1568，传更大的图只是浪费上传时间。Ge
 
 HTTP 200 后仍可能出现流内错误。协议层必须识别并附上已确认的部分用量；SSE 读取器只能捕获 JSON 解析失败，不能吞掉业务回调的异常。
 
+参数自适应只处理 400/422，且只有实际调整成功才增加计数。临时失败不能消耗调整次数。
+文本上限在填充比例之后应用，默认 250,000、最大 2,000,000；页面和运行快照都保留该值。
+SSE 写入必须经过 `writeSse()`，背压或断线时断开订阅，不能持续积压遥测数据。
+
 ## 等待必须可取消
 
 `sleep()` 是禁止的。用 `#sleep()`——它挂在共享 `AbortSignal` 上。普通的 `setTimeout` 会让
@@ -102,8 +106,9 @@ HTTP 200 后仍可能出现流内错误。协议层必须识别并附上已确�
 
 ```bash
 node server.js              # 起服务，默认 127.0.0.1:8791，PORT 可覆盖
-node scripts/selftest.js    # 离线自测（46 项）
-node scripts/review-throughput.js # 本轮吞吐与预算回归（15 项，已包含在完整自测中）
+node scripts/selftest.js    # 离线自测（60 项）
+node scripts/review-throughput.js # 吞吐与预算回归（21 项，已包含在完整自测中）
+node scripts/server-selftest.js # 服务端契约与订阅回归（8 项，已包含在完整自测中）
 ```
 
 审查记录在 `docs/issues/`，三轮共记录 29 次问题（含重开），均已处理。改调度器或协议层之前建议先扫一眼——

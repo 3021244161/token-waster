@@ -22,7 +22,7 @@
       <p><strong>它不产出任何东西。</strong>没有文案、没有代码、没有图片。模型输出的每一个 token 都会被立刻丢弃。你付钱，换回一个变大的数字。</p>
       <p><strong>只对你自己的账号使用。</strong>你需要自备 API key，费用从你自己的账单里扣。这个项目不会、也不能替你付钱。</p>
       <p><strong>key 只活在这个进程的内存里。</strong>不写磁盘、不进日志、不上传任何地方。刷新页面就没了，重启服务就没了。请勿在公用电脑上使用。</p>
-      <p><strong>费用可能超出你的预期。</strong>工具会在启动前强制要求你设一个硬上限（金额 / token / 请求数 / 时长四选一以上），达到上限立即熔断。但估算价格表可能过时，实际账单以服务商为准。</p>
+      <p><strong>费用可能超出你的预期。</strong>启动前必须设置金额或时长上限，还可叠加用量和次数限制，先到先停。价格和用量存在估算误差，实际账单以服务商为准。</p>
       <p><strong>不要用它绕过任何配额或条款。</strong>部分服务商禁止自动化滥用行为。你对自己的账号行为负责——包括被限流、被降级、被封禁。</p>
       <p><strong>如果你不确定自己在做什么，请关掉这个页面。</strong>这不是一个需要"试一试"的东西。</p>
       <p class="gate-fine">本项目是讽刺性的工程玩具，用于观察 API 计费行为与限流机制。作者不对任何账单、账号状态或数据损失负责。MIT License，无任何担保。</p>
@@ -69,7 +69,10 @@
       <div class="field">
         <label for="provider">服务商</label>
         <select id="provider"></select>
-        <div class="hint" id="providerHint"></div>
+        <details class="provider-details">
+          <summary>查看服务商说明</summary>
+          <div class="hint" id="providerHint"></div>
+        </details>
       </div>
 
       <div class="field">
@@ -110,7 +113,7 @@
           <div class="field"><label for="priceIn">输入 $/1M</label><input id="priceIn" type="number" min="0" step="0.01" /></div>
           <div class="field"><label for="priceOut">输出 $/1M</label><input id="priceOut" type="number" min="0" step="0.01" /></div>
         </div>
-        <div class="hint">内置价格表核对于 2026-10，可能已过时。以服务商账单为准。</div>
+        <div class="hint">价格和汇率均为内置估算。非美元计价请同时保留时长或次数上限，实际费用以服务商账单为准。</div>
       </details>
 
       <hr />
@@ -147,7 +150,7 @@
       </div>
 
       <details class="adv" open>
-        <summary>硬上限（至少一项，不可关闭）</summary>
+        <summary>硬上限 · 金额或时长必填</summary>
         <div class="field-row three">
           <div class="field"><label for="maxUsd">最多花 $</label><input id="maxUsd" type="number" min="0" step="0.5" value="2" /></div>
           <div class="field"><label for="maxRequests">最多请求</label><input id="maxRequests" type="number" min="0" step="10" value="200" /></div>
@@ -167,7 +170,12 @@
         <div class="field">
           <label for="contextFill">输入填充率 <b id="fillVal">25%</b></label>
           <input id="contextFill" type="range" min="0" max="95" step="5" value="25" />
-          <div class="hint">输入 token 便宜但量大：拉高 → token 总数涨得快；拉低 → 烧钱更快。</div>
+          <div class="hint">填充率决定文本目标，再受单次文本上限、上下文和预算约束。</div>
+        </div>
+        <div class="field">
+          <label for="maxFillerTokens">单次文本上限（含固定指令）</label>
+          <input id="maxFillerTokens" type="number" min="1024" max="2000000" step="1000" value="250000" aria-describedby="inputEstimate" />
+          <div class="hint" id="inputEstimate">填充比例和单次文本上限共同生效；体积为本地粗估，不含图片。</div>
         </div>
         <div class="field">
           <label for="imageCount">图片张数 <b id="imgVal">4</b></label>
@@ -176,7 +184,7 @@
         <div class="field">
           <label for="imageSize">图片边长 <b id="sizeVal">1536</b>px</label>
           <input id="imageSize" type="range" min="256" max="4096" step="256" value="1536" />
-          <div class="hint">用低熵色块 PNG：文件几十 KB，计费按像素。上传很轻，账单很重。</div>
+          <div class="hint">图片会复用以减少本机准备时间；尺寸与张数共同影响上传和计量。</div>
         </div>
         <div class="field">
           <label for="effort">推理强度</label>
@@ -234,7 +242,7 @@
   <section class="stage">
 
     <div class="counter-wrap">
-      <div class="counter-label">TOKENS INCINERATED</div>
+      <div class="counter-label">累计消耗</div>
       <div class="counter" id="counter">0</div>
       <div class="counter-sub">
         <span id="counterIn">in 0</span>
@@ -260,7 +268,7 @@
       </div>
       <div class="gauge">
         <div class="g-label">请求 / 失败</div>
-        <div class="g-val" id="gReq">0<span>/0</span></div>
+        <div class="g-val" id="gReq">0<span>0 失败 · 实际并发 0/4</span></div>
       </div>
     </div>
 

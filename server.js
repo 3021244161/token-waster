@@ -21,6 +21,7 @@ import { PROVIDERS, CATALOG_VERSION, getProvider, getModel } from './src/config.
 import { Burner } from './src/engine.js';
 import { callProvider } from './src/protocols/index.js';
 import { renderReport } from './src/report.js';
+import { writeSse } from './src/sse.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -53,11 +54,7 @@ let starting = false;
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of state.sse) {
-    try {
-      res.write(payload);
-    } catch {
-      state.sse.delete(res);
-    }
+    if (!writeSse(res, payload)) state.sse.delete(res);
   }
 }
 
@@ -139,7 +136,7 @@ function buildConfig(body) {
     price: {
       in: num(custom.priceIn ?? catalogModel?.price?.in, 0, { max: 1000 }),
       out: num(custom.priceOut ?? catalogModel?.price?.out, 0, { max: 1000 }),
-      currency: custom.currency || catalogModel?.price?.currency || 'USD',
+      currency: String(custom.currency || catalogModel?.price?.currency || 'USD').toUpperCase(),
     },
     vision: custom.vision ?? catalogModel?.vision ?? true,
     reasoning: custom.reasoning ?? catalogModel?.reasoning ?? false,
@@ -164,6 +161,10 @@ function buildConfig(body) {
   if (mode === 'tokens') limitTokens = targetValue;
   if (mode === 'usd') limitUsd = targetValue;
   if (mode === 'requests') limitRequests = targetValue;
+  if (mode === 'time') {
+    if (targetValue <= 0) throw new BadRequest('目标时长必须大于 0 秒');
+    limitDurationMs = targetValue * 1000;
+  }
 
   if (isDrain) {
     // 无忧燃尽 has no money or token ceiling by definition — the provider's own
@@ -215,6 +216,11 @@ function buildConfig(body) {
     );
   }
 
+  if (!['USD', 'CNY', 'EUR'].includes(model.price.currency)) throw new BadRequest('仅支持 USD、CNY 或 EUR 计价');
+  if (model.price.currency !== 'USD' && !Number.isFinite(limitDurationMs) && !Number.isFinite(limitRequests)) {
+    throw new BadRequest('非美元计价使用估算汇率，请同时设置时长或请求数上限');
+  }
+
   const strategy = ['max-output', 'image-bomb', 'mixed'].includes(body.strategy) ? body.strategy : 'max-output';
 
   const imageSize = num(body.imageSize, provider.imageLongEdge || 1536, { min: 256, max: 4096 });
@@ -238,6 +244,7 @@ function buildConfig(body) {
     limitRequests,
     limitDurationMs,
     contextFill: num(body.contextFill, 0.25, { min: 0, max: 0.95 }),
+    maxFillerTokens: Math.floor(num(body.maxFillerTokens, 250_000, { min: 1024, max: 2_000_000 })),
     imageShare: num(body.imageShare, 0.6, { min: 0, max: 0.95 }),
     imageCount: strategy === 'max-output' ? Math.min(1, imageCount) : maxImagesPerRequest,
     imageSize,
@@ -434,14 +441,20 @@ const routes = {
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
     });
-    res.write(': connected\n\n');
+    if (!writeSse(res, ': connected\n\n')) return;
     state.sse.add(res);
     req.on('close', () => state.sse.delete(res));
 
     if (state.burner) {
-      res.write(`event: tick\ndata: ${JSON.stringify(state.burner.snapshot())}\n\n`);
+      if (!writeSse(res, `event: tick\ndata: ${JSON.stringify(state.burner.snapshot())}\n\n`)) {
+        state.sse.delete(res);
+        return;
+      }
       for (const l of state.burner.logs.slice(-40)) {
-        res.write(`event: log\ndata: ${JSON.stringify(l)}\n\n`);
+        if (!writeSse(res, `event: log\ndata: ${JSON.stringify(l)}\n\n`)) {
+          state.sse.delete(res);
+          return;
+        }
       }
     }
   },

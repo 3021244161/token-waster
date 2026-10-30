@@ -6,7 +6,7 @@
 > **It produces nothing. Every completion is discarded the moment it arrives.**
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="token-waster" width="900">
+  <img src="docs/readability-desktop.jpg" alt="Local interface" width="900">
 </p>
 
 ---
@@ -19,7 +19,7 @@ This is not an AI tool. It has no use case beyond cost.
 - **Output** — none. Not one token is kept.
 - **Where the key goes** — into this Node process's memory. Not to disk, not to
   a log, not anywhere else. Close the process and it is gone.
-- **Runaway protection** — a run with no hard ceiling is rejected by the server.
+- **Runaway protection** — ordinary runs require a money or duration ceiling.
   Money, token, request and duration caps all apply simultaneously; whichever
   trips first stops everything. You cannot turn this off from the UI.
 - **Don't** use this to evade a provider's quota or terms. Some vendors forbid
@@ -40,6 +40,14 @@ dashboard.
 
 It keeps running when you close the tab (the server owns the run). Reload and it
 re-attaches.
+
+The advanced controls expose a per-request text ceiling, including fixed
+instructions: 250,000 by default, adjustable from 1,024 to 2,000,000 through the
+UI or `maxFillerTokens`. The context fill ratio is applied before this ceiling;
+output, images, context capacity, and budgets may reduce the final input further.
+The UI shows a rough upload-size estimate. Large fills are prepared in cancellable
+batches. Non-USD pricing requires a duration or request-count backstop because
+exchange rates are estimates.
 
 ## What it is not
 
@@ -65,7 +73,7 @@ Then open http://127.0.0.1:8791.
 2. Pick a provider, paste a key, confirm the model id.
 3. Hit **send one minimal request** — costs a few dozen tokens, proves the key,
    endpoint and model string are right before you commit to a real run.
-4. Set a target and at least one hard ceiling.
+4. Set a target and a money or duration ceiling.
 5. Ignite.
 
 Dry run (plan and estimate, send nothing):
@@ -266,7 +274,8 @@ node scripts/selftest.js
 
 Spins up a mock vendor speaking all three protocols and drives the real engine
 against it: usage accounting, quota convergence, money/request cutoffs, abort,
-PNG size, prefix randomness. 46 tests, no network, no key.
+PNG size, prefix randomness, HTTP validation, and bounded event delivery. 60 checks,
+using loopback mocks only; no external services.
 
 ## Review record
 

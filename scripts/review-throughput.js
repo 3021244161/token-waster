@@ -29,12 +29,19 @@ export async function runThroughputTests() {
     const input = estimateTokens(system + text) + imageCount * estimateImageTokens(anthropic ? 'anthropic-messages' : gemini ? 'gemini-generate' : 'openai-chat', 1536, 1536);
     const out = body.max_completion_tokens ?? body.max_tokens ?? body.generationConfig?.maxOutputTokens;
     records.push({ input, out, imageCount, thinking: body.thinking, committed: burner.snapshot().committedUsd });
+    const attempt = records.length;
     active++;
     peak = Math.max(peak, active);
     res.once('close', () => active--);
     const timer = setTimeout(() => {
       timers.delete(timer);
       if (res.destroyed) return;
+      if (kind === 'adapt-errors' || kind === 'only-errors') {
+        const adapt = kind === 'adapt-errors' && attempt > 7;
+        res.writeHead(adapt ? 400 : 500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: adapt ? 'max_tokens is too large for this model' : 'upstream unavailable' } }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       const event = data => res.write('data: ' + JSON.stringify(data) + '\n\n');
       if (kind === 'stream-error' || kind === 'partial-error' || kind === 'rate-error') {
@@ -71,9 +78,10 @@ export async function runThroughputTests() {
     effort: null, thinkingBudget: 0, requestTimeoutMs: 2000, streamIdleMs: 1500,
     maxRetries: 0, dryRun: false, ...overrides,
   });
-  async function run(kind, overrides = {}) {
+  async function run(kind, overrides = {}, observe) {
     phase = kind; records = []; active = 0; peak = 0;
     burner = new Burner(cfg(overrides));
+    observe?.(burner);
     const snap = await burner.run();
     assert.equal(snap.activeRequests, 0);
     assert.equal(burner.reservedRequests, 0);
@@ -147,6 +155,55 @@ export async function runThroughputTests() {
       });
       assert.equal(records[0].out, 1024);
       assert.equal(records[0].thinking, undefined);
+    });
+    await check('small output allowance omits manual thinking before sending', async () => {
+      await run('image', {
+        protocol: 'anthropic-messages', baseUrl: 'http://127.0.0.1:' + port,
+        concurrency: 1, limitRequests: 1, thinkingBudget: 4000,
+        model: { id: 'fixture', ctx: 200000, maxOut: 800, price: { in: 1, out: 2, currency: 'USD' } },
+      });
+      assert.equal(records.length, 1);
+      assert.equal(records[0].out, 800);
+      assert.equal(records[0].thinking, undefined);
+    });
+    await check('large output allowance preserves a valid thinking budget', async () => {
+      await run('image', {
+        protocol: 'anthropic-messages', baseUrl: 'http://127.0.0.1:' + port,
+        concurrency: 1, limitRequests: 1, thinkingBudget: 4000,
+        model: { id: 'fixture', ctx: 300000, maxOut: 128000, price: { in: 1, out: 2, currency: 'USD' } },
+      });
+      assert.equal(records[0].thinking.budget_tokens, 4000);
+    });
+    await check('transient failures cannot spend the parameter adjustment budget', async () => {
+      await run('adapt-errors', {
+        concurrency: 8, limitRequests: 8, limitDurationMs: 1500,
+        model: { id: 'fixture', ctx: 300000, maxOut: 128000, price: { in: 1, out: 2, currency: 'USD' } },
+      }, b => b.on('log', entry => { if (/adjusting to provider limits/.test(entry.msg)) b.stop('adjustment observed'); }));
+      assert.equal(burner.limitAdjustments, 1);
+      assert.equal(burner.model.maxOut, 64000);
+      assert.ok(burner.logs.some(entry => /adjusting to provider limits/.test(entry.msg)));
+    });
+    await check('runs containing only server failures make no parameter adjustments', async () => {
+      await run('only-errors', { limitRequests: 8, concurrency: 8, limitDurationMs: 250 });
+      assert.equal(burner.limitAdjustments, 0);
+    });
+    await check('text ceiling applies after the chosen context fill ratio', async () => {
+      await run('image', {
+        concurrency: 1, limitRequests: 1, maxFillerTokens: 50000, contextFill: 0.25,
+        model: { id: 'fixture', ctx: 10000000, maxOut: 4000, price: { in: 1, out: 2, currency: 'USD' } },
+      });
+      assert.ok(records[0].input > 49000 && records[0].input <= 50000);
+      assert.equal(burner.snapshot().config.maxFillerTokens, 50000);
+    });
+    await check('large text preparation can stop before any HTTP request', async () => {
+      const started = Date.now();
+      const s = await run('image', {
+        concurrency: 1, limitRequests: 1, maxFillerTokens: 2000000, contextFill: 0.95,
+        model: { id: 'fixture', ctx: 10000000, maxOut: 4000, price: { in: 1, out: 2, currency: 'USD' } },
+      }, b => setImmediate(() => b.stop('stop during preparation')));
+      assert.equal(s.wire, 0);
+      assert.equal(records.length, 0);
+      assert.ok(Date.now() - started < 1000);
     });
     for (const protocol of ['openai-chat', 'anthropic-messages', 'gemini-generate']) {
       await check(protocol + ' stream errors fail without invented usage', async () => {

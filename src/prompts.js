@@ -111,6 +111,20 @@ export function makeFiller(targetTokens) {
   return pieces.join('');
 }
 
+/** Yield between small batches so large, user-selected fills remain stoppable. */
+export async function makeFillerAsync(targetTokens, { signal } = {}) {
+  const pieces = [];
+  let emitted = 0;
+  while (emitted < targetTokens) {
+    await new Promise(resolve => setImmediate(resolve));
+    if (signal?.aborted) throw signal.reason;
+    const piece = makeFiller(Math.min(5000, targetTokens - emitted));
+    pieces.push(piece);
+    emitted += estimateTokens(piece);
+  }
+  return pieces.join('');
+}
+
 /* ── Output-forcing tasks ─────────────────────────────────────────────────── */
 
 const TASKS = [

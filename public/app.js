@@ -73,6 +73,7 @@ function applyRunConfig(cfg) {
   }
   if (cfg.concurrency) $('concurrency').value = cfg.concurrency;
   if (typeof cfg.contextFill === 'number') $('contextFill').value = Math.round(cfg.contextFill * 100);
+  if (typeof cfg.maxFillerTokens === 'number') $('maxFillerTokens').value = cfg.maxFillerTokens;
   if (typeof cfg.imageSize === 'number') $('imageSize').value = cfg.imageSize;
   if (typeof cfg.imageCount === 'number') $('imageCount').value = cfg.imageCount;
   syncSliderLabels();
@@ -151,6 +152,7 @@ function onModelChange() {
     $('modelHint').textContent = '不在内置表里 → 请手动填写下方限制与价格';
   }
   validate();
+  updateInputEstimate();
 }
 
 /* ── gate ─────────────────────────────────────────────────────────────────── */
@@ -221,6 +223,7 @@ function readForm() {
     targetValue: numOr('targetValue', 0),
     concurrency: numOr('concurrency', 4),
     contextFill: numOr('contextFill', 25) / 100,
+    maxFillerTokens: numOr('maxFillerTokens', 250000),
     imageCount: numOr('imageCount', 4),
     imageSize: numOr('imageSize', 1536),
     effort: $('effort').value || null,
@@ -622,6 +625,16 @@ function syncSliderLabels() {
   set('imageCount', 'imgVal');
   set('imageSize', 'sizeVal');
   set('thinkingBudget', 'thinkVal', (v) => (Number(v) === 0 ? '关' : nf.format(v)));
+  updateInputEstimate();
+}
+
+function updateInputEstimate() {
+  const ctx = Number($('ctx').value) || 128000;
+  const fill = Number($('contextFill').value) / 100;
+  const cap = Math.max(1024, Math.min(2000000, Number($('maxFillerTokens').value) || 250000));
+  const planned = Math.min(Math.floor(ctx * fill), cap);
+  const mb = (planned * 6 / 1048576).toFixed(1);
+  $('inputEstimate').textContent = `文本目标约 ${nf.format(planned)}，上传体积粗估 ${mb} MB（不含图片）。还会按输出额度、上下文和预算缩小。`;
 }
 
 function toast(msg, bad = false) {
@@ -647,10 +660,10 @@ function reasonText(r) {
 
 const STRATEGY_HINT = {
   'max-output':
-    '把 max_tokens 拉满，用"禁止总结/禁止省略"的指令逼模型持续输出。输出 token 最贵，这条路烧钱最快。',
+    '优先申请长输出。实际速度取决于模型、并发和账号限额。',
   'image-bomb':
-    '塞满低熵大图。计费按像素、不按文件大小 —— 几十 KB 的 PNG 能顶几千 token 的输入。适合测视觉通道。',
-  mixed: '图文一起上：输入填到上下文的 25%，图片再吃掉一大块，剩下的全部让模型写完。',
+    '使用压缩色块图片观察视觉输入消耗，图片数量仍受上下文和预算约束。',
+  mixed: '同时使用文本和图片，并为输出预留空间。输入比例可在高级设置里调整。',
 };
 
 /* ── events ───────────────────────────────────────────────────────────────── */
@@ -697,6 +710,7 @@ function bind() {
   for (const id of ['concurrency', 'contextFill', 'imageCount', 'imageSize', 'thinkingBudget']) {
     $(id).addEventListener('input', syncSliderLabels);
   }
+  for (const id of ['ctx', 'maxFillerTokens']) $(id).addEventListener('input', updateInputEstimate);
 
   $('ignite').addEventListener('click', ignite);
   $('kill').addEventListener('click', kill);

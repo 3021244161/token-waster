@@ -25,7 +25,7 @@
 
 import { EventEmitter } from 'node:events';
 import { callProvider } from './protocols/index.js';
-import { buildPayload, makeFiller, estimateTokens, trimFiller } from './prompts.js';
+import { buildPayload, makeFillerAsync, estimateTokens, trimFiller } from './prompts.js';
 import { makeImagePoolAsync, estimateImageTokens } from './images.js';
 import { estimateCostUsd } from './config.js';
 
@@ -157,6 +157,7 @@ export class Burner extends EventEmitter {
         strategy: this.cfg.strategy,
         concurrency: this.cfg.concurrency,
         contextFill: this.cfg.contextFill,
+        maxFillerTokens: this.cfg.maxFillerTokens ?? 250_000,
         imageCount: this.cfg.imageCount,
         imageSize: this.cfg.imageSize,
         mode: this.cfg.mode,
@@ -316,6 +317,8 @@ export class Burner extends EventEmitter {
    */
   async #execute(plan) {
     const payload = plan.payload;
+    const filler = plan.fillerTokens > 0 ? await this.#fillerFor(plan.fillerTokens) : '';
+    payload.filler = filler ? '\n\n' + filler + '\n\n' : '\n\n';
     const images = this.#pickImages(plan.imageCount);
     const maxAttempts = Math.max(0, this.cfg.maxRetries ?? 2);
 
@@ -490,7 +493,7 @@ export class Burner extends EventEmitter {
     const shortLimit = model.reasoning || this.cfg.effort ? 1024 : MIN_OUTPUT;
     const desiredOutput = Math.min(model.maxOut, this.cfg.shortOutput ? shortLimit : model.maxOut, ctx - overhead - imgTokens);
     if (desiredOutput < MIN_OUTPUT) return null;
-    const desiredText = Math.max(overhead, Math.floor(Math.min(ctx - imgTokens, this.cfg.maxFillerTokens ?? 250_000) * this.cfg.contextFill));
+    const desiredText = Math.max(overhead, Math.min(Math.floor((ctx - imgTokens) * this.cfg.contextFill), this.cfg.maxFillerTokens ?? 250_000));
     let fillerTokens = Math.max(0, Math.min(desiredText - overhead, ctx - imgTokens - overhead - desiredOutput));
     const extraOutput = desiredOutput - MIN_OUTPUT;
     const fixedTokens = overhead + imgTokens + MIN_OUTPUT;
@@ -505,12 +508,9 @@ export class Burner extends EventEmitter {
     fillerTokens = Math.floor(fillerTokens * scale);
     const maxOutput = MIN_OUTPUT + Math.floor(extraOutput * scale);
 
-    // The cached filler is trimmed with the same estimator used here. A
-    // character ratio alone can exceed a small allocation on mixed text.
-    const filler = fillerTokens > 0 ? this.#fillerFor(fillerTokens) : '';
-    payload.filler = filler ? '\n\n' + filler + '\n\n' : '\n\n';
-    const fillerSize = estimateTokens(filler);
-    const estInput = overhead + fillerSize + imgTokens;
+    // Reserve first; actual preparation yields to cancellation. Exact trimming
+    // guarantees the generated filler never exceeds this estimate.
+    const estInput = overhead + fillerTokens + imgTokens;
     const estTokens = Math.ceil((estInput + maxOutput) * TOKEN_MARGIN);
     const estUsd = estimateCostUsd(model, { input: estInput, output: maxOutput }) * COST_MARGIN;
     if (estTokens > remTokens || estUsd > remUsd + 1e-12 || estInput + maxOutput > ctx) {
@@ -518,7 +518,7 @@ export class Burner extends EventEmitter {
       return null;
     }
 
-    return { maxOutput, imageCount, fillerTokens: fillerSize, outputBias, payload, estInput, estOutput: maxOutput, estTokens, estUsd };
+    return { maxOutput, imageCount, fillerTokens, outputBias, payload, estInput, estOutput: maxOutput, estTokens, estUsd };
   }
 
   #accountInterrupted(plan, usage) {
@@ -608,7 +608,7 @@ export class Burner extends EventEmitter {
     // A 400 that says "too many tokens" is not a broken key, it is a catalog
     // value that does not match this account's model. Shrink the offending
     // number and retry instead of burning the rest of the run on failures.
-    if (this.#adaptLimits(msg)) {
+    if ((err?.status === 400 || err?.status === 422) && this.#adaptLimits(msg)) {
       this.#log('warn', `adjusting to provider limits: ctx ${this.model.ctx}, maxOut ${this.model.maxOut}`);
       return;
     }
@@ -715,7 +715,7 @@ export class Burner extends EventEmitter {
    * surfaces as errors instead of looping forever.
    */
   #adaptLimits(msg) {
-    if (this.limitAdjustments++ > 6) return false;
+    if (this.limitAdjustments >= 6) return false;
     const m = msg.toLowerCase();
 
     const contextish = /context|too long|length limit|reduce the length|超过|过长/.test(m);
@@ -723,11 +723,13 @@ export class Burner extends EventEmitter {
 
     if (contextish && this.model.ctx > 8192) {
       this.model.ctx = Math.floor(this.model.ctx * 0.5);
+      this.limitAdjustments++;
       this.fillerCache.clear();
       return true;
     }
     if (outputish && this.model.maxOut > 512) {
       this.model.maxOut = Math.floor(this.model.maxOut * 0.5);
+      this.limitAdjustments++;
       return true;
     }
     return false;
@@ -794,7 +796,7 @@ export class Burner extends EventEmitter {
     return pool.slice(0, Math.min(n, pool.length));
   }
 
-  #fillerFor(tokens) {
+  async #fillerFor(tokens) {
     if (tokens <= 0) return '';
 
     // Bucket upwards so a 1k request can still reuse a cached 25k blob, then
@@ -802,17 +804,17 @@ export class Burner extends EventEmitter {
     // was a 25× overshoot on small quotas — it blew both the token target and the
     // context window.
     const key = Math.max(FILLER_BUCKET, Math.ceil(tokens / FILLER_BUCKET) * FILLER_BUCKET);
-    let text = this.fillerCache.get(key);
+    let pending = this.fillerCache.get(key);
 
-    if (!text) {
-      text = makeFiller(key);
-      this.fillerCache.set(key, text);
+    if (!pending) {
+      pending = makeFillerAsync(key, { signal: this.ac.signal });
+      this.fillerCache.set(key, pending);
       if (this.fillerCache.size > MAX_FILLER_CACHE) {
         this.fillerCache.delete(this.fillerCache.keys().next().value);
       }
     }
 
-    return trimFiller(text, tokens);
+    return trimFiller(await pending, tokens);
   }
 
   /* ── dry run ────────────────────────────────────────────────────────────── */
