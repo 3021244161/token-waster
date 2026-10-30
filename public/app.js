@@ -359,7 +359,8 @@ function applySnapshot(s) {
   $('gCost').textContent = `$${(s.costUsd || 0).toFixed(4)}`;
   $('gReq').innerHTML =
     `${nf.format(s.requests || 0)}<span> / ${nf.format(s.failed || 0)} 失败` +
-    `${s.permits ? ` · 并发 ${s.permits}` : ''}</span>`;
+    `${s.permits ? ` · 实际并发 ${s.activeRequests ?? s.inflight ?? 0}/${s.permits}` : ''}` +
+    `${s.unknownUsage ? ` · ${s.unknownUsage} 次用量未完全确认` : ''}</span>`;
   $('report').disabled = false;
 
   updateProgress(s);
@@ -381,12 +382,12 @@ function updateProgress(s) {
   if (Number.isFinite(lim.tokens) && lim.tokens) {
     value = s.committedTokens || s.total || 0;
     total = lim.tokens;
-    label = 'token 进度';
+    label = '用量预算（含预留）';
     fmt = (v) => nf.format(Math.round(v));
   } else if (Number.isFinite(lim.usd) && lim.usd) {
     value = s.committedUsd || s.costUsd || 0;
     total = lim.usd;
-    label = '预算进度';
+    label = '金额预算（含预留）';
     fmt = (v) => `$${v.toFixed(4)}`;
   } else if (Number.isFinite(lim.requests) && lim.requests) {
     // The server counts every HTTP call against this ceiling, retries included,
@@ -409,7 +410,8 @@ function updateProgress(s) {
   if (total > 0) {
     const pct = Math.min(100, (value / total) * 100);
     $('pFill').style.width = `${pct}%`;
-    $('pText').textContent = `${fmt(value)} / ${fmt(total)}  ·  ${pct.toFixed(1)}%`;
+    $('pText').textContent = `${fmt(value)} / ${fmt(total)}  ·  ${pct.toFixed(1)}%` +
+      (s.unknownUsage ? ' · 含中断调用的待确认预留' : '');
   } else {
     $('pFill').style.width = '0%';
     $('pText').textContent = `${fmt(value)} · 未设目标`;
@@ -632,6 +634,7 @@ function toast(msg, bad = false) {
 
 function reasonText(r) {
   if (!r) return '未知原因';
+  if (r === 'remaining budget below minimum request cost') return '剩余额度不足以发送最小请求';
   if (/token target/.test(r)) return '达到 token 目标';
   if (/budget/.test(r)) return '达到金额上限';
   if (/request limit/.test(r)) return '达到请求数上限';

@@ -93,6 +93,25 @@ export function joinUrl(base, path) {
   return `${base.replace(/\/+$/, '')}${path}`;
 }
 
+/** HTTP 200 does not imply success once an event stream has started. */
+export function throwIfError(event) {
+  if (!event?.error && event?.type !== 'error') return;
+  const detail = event.error || event;
+  const kind = String(detail.type || detail.status || detail.code || '').toLowerCase();
+  const code = Number(detail.code || detail.status);
+  const status = code >= 400 && code <= 599 ? code
+    : /rate.?limit|resource_exhausted/.test(kind) ? 429
+    : /overload/.test(kind) ? 529
+    : /authentication|unauthenticated/.test(kind) ? 401
+    : /permission/.test(kind) ? 403
+    : /not_found/.test(kind) ? 404
+    : /invalid/.test(kind) ? 400
+    : 500;
+  const err = new ApiError(status, JSON.stringify({ error: detail }), '');
+  err.streamFailure = true;
+  throw err;
+}
+
 /**
  * POST JSON and return the raw Response. Throws ApiError for non-2xx.
  * Caller owns body consumption.
@@ -169,11 +188,14 @@ export async function readSse(res, { onData, onRaw, signal, idleMs = 0 } = {}) {
           }
           const data = line.slice(5).trim();
           if (!data || data === '[DONE]') continue;
+          let parsed;
           try {
-            onData?.(JSON.parse(data));
+            parsed = JSON.parse(data);
           } catch {
             onRaw?.(data);
+            continue;
           }
+          onData?.(parsed);
         }
       }
     }
@@ -182,6 +204,8 @@ export async function readSse(res, { onData, onRaw, signal, idleMs = 0 } = {}) {
     throw err;
   } finally {
     clearTimeout(idleTimer);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
 
   if (stalled) throw stallError(idleMs);

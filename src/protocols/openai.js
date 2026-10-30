@@ -14,7 +14,7 @@
  *    two extra times per call, which on a slow link dominates everything.
  */
 
-import { postJson, readSse, joinUrl, emptyUsage, finalizeUsage, isShapeError } from './http.js';
+import { postJson, readSse, joinUrl, emptyUsage, finalizeUsage, isShapeError, throwIfError } from './http.js';
 
 const SAMPLE_CHARS = 160;
 
@@ -113,6 +113,7 @@ export async function callOpenAI({
   extraQuery = '',
   preferredVariant = null,
   beforeSend = null,
+  afterSend = null,
 }) {
   const url = joinUrl(baseUrl, path) + extraQuery;
   const variants = buildVariants({ model, payload, images, maxOutput, effort });
@@ -127,10 +128,13 @@ export async function callOpenAI({
     const sink = makeSink();
     const more = n < order.length - 1;
 
+    let sent = false;
+    let streaming = false;
     try {
       // Counts against the call ceiling at the only place that knows a request is
       // really leaving the machine — including variant probing.
       beforeSend?.();
+      sent = true;
 
       const res = await postJson(url, {
         headers: { [authHeader]: `${authPrefix}${apiKey}`, ...headers },
@@ -141,16 +145,19 @@ export async function callOpenAI({
 
       if (body.stream === false) {
         const json = await res.json();
+        throwIfError(json);
         absorbUsage(json.usage, usage);
         sink.push(json?.choices?.[0]?.message?.content || '');
         usage.reported = !!json.usage;
         return { usage: finalizeUsage(usage, sink.chars), textLength: sink.chars, sample: sink.sample, variant: vi };
       }
 
+      streaming = true;
       await readSse(res, {
         signal,
         idleMs: streamIdleMs,
         onData: (ev) => {
+          throwIfError(ev);
           if (ev.usage) {
             absorbUsage(ev.usage, usage);
             usage.reported = true;
@@ -164,17 +171,23 @@ export async function callOpenAI({
       return { usage: finalizeUsage(usage, sink.chars), textLength: sink.chars, sample: sink.sample, variant: vi };
     } catch (err) {
       lastErr = err;
+      if (streaming || err.streamFailure) {
+        err.streamFailure = true;
+        err.partialUsage = { ...usage };
+      }
       if (err?.budgetStop) {
         // Ran out of call budget mid-probe. Surface the shape error if we saw one,
         // otherwise the engine learns nothing and keeps the wrong parameters.
         if (shapeErr) throw shapeErr;
         throw err;
       }
-      if (isShapeError(err) && more) {
+      if (!err.streamFailure && isShapeError(err) && more) {
         shapeErr = err;
         continue;
       }
       throw err;
+    } finally {
+      if (sent) afterSend?.();
     }
   }
   throw lastErr;

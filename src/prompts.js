@@ -67,6 +67,21 @@ export function estimateTokens(text) {
   return Math.ceil(cjk * 0.95 + other / 3.6);
 }
 
+/** Keep a prefix within the same estimate used by the reservation ledger. */
+export function trimFiller(text, targetTokens) {
+  let cjk = 0;
+  let other = 0;
+  let end = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0x4e00 && c <= 0x9fff) || (c >= 0x3040 && c <= 0x30ff) || (c >= 0xac00 && c <= 0xd7af)) cjk++;
+    else other++;
+    if (Math.ceil(cjk * 0.95 + other / 3.6) > targetTokens) break;
+    end += ch.length;
+  }
+  return text.slice(0, end);
+}
+
 /**
  * Generate ~`targetTokens` of meaningless-but-unique prose.
  * Deliberately not repetitive: no long shared substrings means no compressed

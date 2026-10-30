@@ -266,7 +266,7 @@ node scripts/selftest.js
 
 Spins up a mock vendor speaking all three protocols and drives the real engine
 against it: usage accounting, quota convergence, money/request cutoffs, abort,
-PNG size, prefix randomness. 31 tests, no network, no key.
+PNG size, prefix randomness. 46 tests, no network, no key.
 
 ## Review record
 

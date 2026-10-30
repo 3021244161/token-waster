@@ -12,7 +12,7 @@
  * request that burned nothing.
  */
 
-import { postJson, readSse, joinUrl, emptyUsage, finalizeUsage, isShapeError } from './http.js';
+import { postJson, readSse, joinUrl, emptyUsage, finalizeUsage, isShapeError, throwIfError } from './http.js';
 import { makeSink, orderVariants } from './openai.js';
 
 const SAFETY = [
@@ -45,6 +45,7 @@ export async function callGemini({
   headers = {},
   preferredVariant = null,
   beforeSend = null,
+  afterSend = null,
 }) {
   const base = joinUrl(baseUrl, `/v1beta/models/${encodeURIComponent(model)}`);
 
@@ -73,8 +74,11 @@ export async function callGemini({
     const sink = makeSink();
     const more = n < order.length - 1;
 
+    let sent = false;
+    let streaming = false;
     try {
       beforeSend?.();
+      sent = true;
 
       const res = await postJson(a.url, {
         headers: { 'x-goog-api-key': apiKey, ...headers },
@@ -85,6 +89,7 @@ export async function callGemini({
 
       if (!a.stream) {
         const json = await res.json();
+        throwIfError(json);
         absorb(json.usageMetadata, usage);
         for (const c of json?.candidates || []) {
           for (const p of c?.content?.parts || []) if (p.text) sink.push(p.text);
@@ -92,10 +97,12 @@ export async function callGemini({
         return { usage: finalizeUsage(usage, sink.chars), textLength: sink.chars, sample: sink.sample, variant: vi };
       }
 
+      streaming = true;
       await readSse(res, {
         signal,
         idleMs: streamIdleMs,
         onData: (ev) => {
+          throwIfError(ev);
           if (ev.usageMetadata) absorb(ev.usageMetadata, usage);
           for (const c of ev?.candidates || []) {
             for (const p of c?.content?.parts || []) if (p.text) sink.push(p.text);
@@ -106,15 +113,21 @@ export async function callGemini({
       return { usage: finalizeUsage(usage, sink.chars), textLength: sink.chars, sample: sink.sample, variant: vi };
     } catch (err) {
       lastErr = err;
+      if (streaming || err.streamFailure) {
+        err.streamFailure = true;
+        err.partialUsage = { ...usage };
+      }
       if (err?.budgetStop) {
         if (shapeErr) throw shapeErr;
         throw err;
       }
-      if (isShapeError(err) && more) {
+      if (!err.streamFailure && isShapeError(err) && more) {
         shapeErr = err;
         continue;
       }
       throw err;
+    } finally {
+      if (sent) afterSend?.();
     }
   }
   throw lastErr;

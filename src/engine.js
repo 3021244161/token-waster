@@ -25,15 +25,16 @@
 
 import { EventEmitter } from 'node:events';
 import { callProvider } from './protocols/index.js';
-import { buildPayload, makeFiller } from './prompts.js';
+import { buildPayload, makeFiller, estimateTokens, trimFiller } from './prompts.js';
 import { makeImagePoolAsync, estimateImageTokens } from './images.js';
 import { estimateCostUsd } from './config.js';
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const FILLER_BUCKET = 25_000; // quantise filler sizes so we can reuse cached text
 const MAX_FILLER_CACHE = 6;
 const MAX_TIMELINE = 2400;
+const TOKEN_MARGIN = 1.05;
+const COST_MARGIN = 1.15;
+const MIN_OUTPUT = 32;
 
 export class Burner extends EventEmitter {
   constructor(cfg) {
@@ -66,6 +67,9 @@ export class Burner extends EventEmitter {
       costUsd: 0,
       inflight: 0,
       peakInflight: 0,
+      activeRequests: 0,
+      peakActiveRequests: 0,
+      unknownUsage: 0,
       throttled: 0,
       estimateOnly: 0,
       lastError: '',
@@ -75,6 +79,10 @@ export class Burner extends EventEmitter {
     this.reservedTokens = 0;
     this.reservedUsd = 0;
     this.reservedRequests = 0;
+    // Failed streams may already have been billed. Hold their unconfirmed
+    // remainder against the budget without claiming it as measured consumption.
+    this.unconfirmedTokens = 0;
+    this.unconfirmedUsd = 0;
 
     this.limits = {
       tokens: cfg.limitTokens ?? Infinity,
@@ -154,9 +162,11 @@ export class Burner extends EventEmitter {
         mode: this.cfg.mode,
         mtokens: fin(this.limits.tokens),
       },
-      // Committed = settled + promised to in-flight requests.
-      committedTokens: s.total + this.reservedTokens,
-      committedUsd: s.costUsd + this.reservedUsd,
+      // Committed includes unconfirmed interrupted calls as well as live ones.
+      committedTokens: s.total + this.reservedTokens + this.unconfirmedTokens,
+      committedUsd: s.costUsd + this.reservedUsd + this.unconfirmedUsd,
+      unconfirmedTokens: this.unconfirmedTokens,
+      unconfirmedUsd: this.unconfirmedUsd,
     };
   }
 
@@ -277,9 +287,7 @@ export class Burner extends EventEmitter {
         }
 
         // Reserve before dispatch so N workers cannot collectively blow past the cap.
-        this.reservedTokens += plan.estTokens;
-        this.reservedUsd += plan.estUsd;
-        this.reservedRequests += 1;
+        if (!this.#reservePlan(plan)) continue;
 
         const t0 = Date.now();
         this.sending++;
@@ -287,9 +295,7 @@ export class Burner extends EventEmitter {
           const res = await this.#execute(plan);
           this.#settle(plan, res, Date.now() - t0);
         } catch (err) {
-          this.reservedTokens -= plan.estTokens;
-          this.reservedUsd -= plan.estUsd;
-          this.reservedRequests -= 1;
+          this.#releasePlan(plan);
           this.#handleError(err, plan);
         } finally {
           this.sending--;
@@ -309,17 +315,18 @@ export class Burner extends EventEmitter {
    * *global* pause, which the throttle handles, not one worker spinning.
    */
   async #execute(plan) {
-    const payload = buildPayload({
-      fillerTokens: plan.fillerTokens,
-      outputBias: plan.outputBias,
-      filler: plan.fillerTokens > 0 ? this.#fillerFor(plan.fillerTokens) : '',
-    });
+    const payload = plan.payload;
     const images = this.#pickImages(plan.imageCount);
     const maxAttempts = Math.max(0, this.cfg.maxRetries ?? 2);
 
     let lastErr;
     for (let attempt = 0; attempt <= maxAttempts; attempt++) {
       try {
+        if (!plan.reserved && !this.#reservePlan(plan)) {
+          const err = new Error('remaining budget cannot cover retry');
+          err.budgetStop = true;
+          throw err;
+        }
         return await callProvider({
           protocol: this.cfg.protocol,
           baseUrl: this.cfg.baseUrl,
@@ -330,17 +337,23 @@ export class Burner extends EventEmitter {
           images,
           maxOutput: plan.maxOutput,
           effort: this.cfg.effort,
-          thinkingBudget: this.cfg.thinkingBudget,
+          thinkingBudget: this.cfg.shortOutput ? 0 : this.cfg.thinkingBudget,
           signal: this.ac.signal,
           timeoutMs: this.cfg.requestTimeoutMs,
           streamIdleMs: this.cfg.streamIdleMs,
           // Every variant probe and retry inside the adapter calls this, so the
           // ceiling counts real HTTP requests rather than logical calls.
           beforeSend: () => this.#reserveCall(),
+          afterSend: () => { this.stats.activeRequests = Math.max(0, this.stats.activeRequests - 1); },
           preferredVariant: this.variantProfile,
         });
       } catch (err) {
+        if (err.budgetStop && lastErr) throw lastErr;
         lastErr = err;
+        if (err.streamFailure) {
+          this.#releasePlan(plan);
+          this.#accountInterrupted(plan, err.partialUsage);
+        }
         if (this.ac.signal.aborted) throw err;
         if (!this.#shouldRetry(err) || attempt === maxAttempts) throw err;
 
@@ -356,12 +369,34 @@ export class Burner extends EventEmitter {
 
   /** Count one real HTTP request against the call ceiling, or refuse it. */
   #reserveCall() {
-    if (this.stats.wire >= this.limits.requests) {
+    if (this.#shouldStop() || this.stats.wire >= this.limits.requests ||
+        this.stats.total + this.reservedTokens + this.unconfirmedTokens > this.limits.tokens ||
+        this.stats.costUsd + this.reservedUsd + this.unconfirmedUsd > this.limits.usd + 1e-12) {
       const e = new Error('request budget exhausted');
       e.budgetStop = true;
       throw e;
     }
     this.stats.wire++;
+    this.stats.activeRequests++;
+    this.stats.peakActiveRequests = Math.max(this.stats.peakActiveRequests, this.stats.activeRequests);
+  }
+
+  #reservePlan(plan) {
+    if (this.stats.total + this.reservedTokens + this.unconfirmedTokens + plan.estTokens > this.limits.tokens ||
+        this.stats.costUsd + this.reservedUsd + this.unconfirmedUsd + plan.estUsd > this.limits.usd + 1e-12) return false;
+    this.reservedTokens += plan.estTokens;
+    this.reservedUsd += plan.estUsd;
+    this.reservedRequests++;
+    plan.reserved = true;
+    return true;
+  }
+
+  #releasePlan(plan) {
+    if (!plan.reserved) return;
+    this.reservedTokens = Math.max(0, this.reservedTokens - plan.estTokens);
+    this.reservedUsd = Math.max(0, this.reservedUsd - plan.estUsd);
+    this.reservedRequests = Math.max(0, this.reservedRequests - 1);
+    plan.reserved = false;
   }
 
   #shouldRetry(err) {
@@ -408,96 +443,101 @@ export class Burner extends EventEmitter {
 
     const model = this.model;
     const ctx = Math.max(4096, model.ctx);
-    const remTokens = this.limits.tokens - this.stats.total - this.reservedTokens;
-    const remUsd = this.limits.usd - this.stats.costUsd - this.reservedUsd;
-
-    if (remTokens <= 512 || remUsd <= 0) return null;
+    const remTokens = this.limits.tokens - this.stats.total - this.reservedTokens - this.unconfirmedTokens;
+    const remUsd = this.limits.usd - this.stats.costUsd - this.reservedUsd - this.unconfirmedUsd;
     if (this.stats.wire >= this.limits.requests) return null;
 
-    // With N permits in flight, one request must not reserve the entire
-    // remaining budget: the first two workers would eat it and the rest would sit
-    // idle, so an "8 concurrent" run ends up executing two at a time. Split the
-    // pot by available slots instead (no-op for large targets and for drain mode).
-    const slots = Math.max(1, this.permits);
-    const perRequest = Number.isFinite(remTokens) ? Math.floor(remTokens / slots) : Infinity;
-    const budget = Number.isFinite(perRequest) ? Math.min(remTokens, Math.max(1024, perRequest)) : Infinity;
+    // Build the fixed content once, then reserve what will actually be sent.
+    // Scaling a notional 400-token overhead to zero never removes the nonce or
+    // instructions from the wire. The envelope covers protocol wrappers.
+    const outputBias = this.cfg.shortOutput ? 'min' : 'max';
+    const payload = buildPayload({ fillerTokens: 0, outputBias });
+    const overhead = estimateTokens(payload.system + '\n\n\n\n' + payload.instruction) + 64;
+    const minTotal = overhead + MIN_OUTPUT;
+    const minUsd = estimateCostUsd(model, { input: overhead, output: MIN_OUTPUT });
+    if (Math.ceil(minTotal * TOKEN_MARGIN) > remTokens || minUsd * COST_MARGIN > remUsd) {
+      this.noPlanReason = 'remaining budget below minimum request cost';
+      return null;
+    }
+
+    // Keep the existing total-quantity granularity, while splitting money by
+    // unoccupied slots. Reduce the slot count when only a few minimum requests
+    // can fit, rather than dividing each share below the cost of a legal call.
+    const affordableTokens = Number.isFinite(remTokens) ? Math.floor(remTokens / Math.ceil(minTotal * TOKEN_MARGIN)) : Infinity;
+    const affordableUsd = minUsd > 0 ? Math.floor(remUsd / (minUsd * COST_MARGIN)) : Infinity;
+    const slots = Math.max(1, Math.min(this.permits - this.sending, this.limits.requests - this.stats.wire, affordableTokens, affordableUsd));
+    const tokenBudget = Number.isFinite(remTokens)
+      ? Math.min(Math.floor(remTokens / TOKEN_MARGIN), Math.max(minTotal, Math.floor(remTokens / this.permits / TOKEN_MARGIN)))
+      : Infinity;
+    const moneyBudget = remUsd / slots / COST_MARGIN;
 
     const strategy = this.cfg.strategy;
     const wantImages = strategy === 'image-bomb' || strategy === 'mixed';
-
-    // ── how many images fit? Bounded by the context window *and* by the budget
-    //    that is actually left — images are the one component the text scaler
-    //    cannot shrink, so they have to be sized before the text is.
     let imageCount = 0;
-    if (wantImages && this.images.length > 0 && this.imgPerImage > 0) {
+    if (wantImages && this.images.length && this.imgPerImage > 0) {
       const imgShare = strategy === 'image-bomb' ? this.cfg.imageShare : Math.min(0.35, this.cfg.imageShare);
-      const span = Math.min(budget, ctx);
-      const byShare = Math.floor((span * imgShare) / this.imgPerImage);
-      const byBudget = Math.floor((budget * 0.85) / this.imgPerImage);
-      imageCount = Math.min(this.images.length, this.cfg.maxImagesPerRequest, Math.max(0, byShare), Math.max(0, byBudget));
+      const span = Math.min(tokenBudget, ctx);
+      const byShare = Math.floor(span * imgShare / this.imgPerImage);
+      const bySpace = Math.floor((span - minTotal) / this.imgPerImage);
+      const imageUsd = estimateCostUsd(model, { input: this.imgPerImage });
+      const byMoney = imageUsd > 0 ? Math.floor((moneyBudget - minUsd) / imageUsd) : Infinity;
+      imageCount = Math.max(0, Math.min(this.images.length, this.cfg.maxImagesPerRequest, byShare, bySpace, byMoney));
+    }
+    const imgTokens = imageCount * this.imgPerImage;
+
+    // Reasoning models keep a small allowance for internal work. Manual
+    // thinking is disabled in input-only mode; it must not consume that reserve.
+    const shortLimit = model.reasoning || this.cfg.effort ? 1024 : MIN_OUTPUT;
+    const desiredOutput = Math.min(model.maxOut, this.cfg.shortOutput ? shortLimit : model.maxOut, ctx - overhead - imgTokens);
+    if (desiredOutput < MIN_OUTPUT) return null;
+    const desiredText = Math.max(overhead, Math.floor(Math.min(ctx - imgTokens, this.cfg.maxFillerTokens ?? 250_000) * this.cfg.contextFill));
+    let fillerTokens = Math.max(0, Math.min(desiredText - overhead, ctx - imgTokens - overhead - desiredOutput));
+    const extraOutput = desiredOutput - MIN_OUTPUT;
+    const fixedTokens = overhead + imgTokens + MIN_OUTPUT;
+    const fixedUsd = estimateCostUsd(model, { input: overhead + imgTokens, output: MIN_OUTPUT });
+    const flexibleUsd = estimateCostUsd(model, { input: fillerTokens, output: extraOutput });
+    const flexibleTokens = fillerTokens + extraOutput;
+    const scale = Math.max(0, Math.min(
+      1,
+      flexibleTokens > 0 ? (tokenBudget - fixedTokens) / flexibleTokens : 1,
+      flexibleUsd > 0 ? (moneyBudget - fixedUsd) / flexibleUsd : 1,
+    ));
+    fillerTokens = Math.floor(fillerTokens * scale);
+    const maxOutput = MIN_OUTPUT + Math.floor(extraOutput * scale);
+
+    // The cached filler is trimmed with the same estimator used here. A
+    // character ratio alone can exceed a small allocation on mixed text.
+    const filler = fillerTokens > 0 ? this.#fillerFor(fillerTokens) : '';
+    payload.filler = filler ? '\n\n' + filler + '\n\n' : '\n\n';
+    const fillerSize = estimateTokens(filler);
+    const estInput = overhead + fillerSize + imgTokens;
+    const estTokens = Math.ceil((estInput + maxOutput) * TOKEN_MARGIN);
+    const estUsd = estimateCostUsd(model, { input: estInput, output: maxOutput }) * COST_MARGIN;
+    if (estTokens > remTokens || estUsd > remUsd + 1e-12 || estInput + maxOutput > ctx) {
+      this.noPlanReason = 'remaining budget below minimum request cost';
+      return null;
     }
 
-    let imgTokens = imageCount * this.imgPerImage;
+    return { maxOutput, imageCount, fillerTokens: fillerSize, outputBias, payload, estInput, estOutput: maxOutput, estTokens, estUsd };
+  }
 
-    // ── text split: fill the context, then let the model write as much as it can.
-    //    Capped because filler is generated as a JS string and uploaded as JSON:
-    //    a 10M-token window would mean ~24 MB of noise per request and seconds of
-    //    CPU before the first byte leaves the machine.
-    const ctxBudget = Math.min(ctx - imgTokens, this.cfg.maxFillerTokens ?? 250_000);
-    let inputTokens = Math.floor(Math.max(0, ctxBudget) * this.cfg.contextFill);
-    let maxOutput = model.maxOut;
-
-    if (inputTokens + maxOutput + imgTokens > ctx) {
-      inputTokens = Math.max(0, ctx - maxOutput - imgTokens);
-    }
-
-    // ── scale the text to whatever is left after the images
-    const wantTotal = inputTokens + maxOutput + imgTokens;
-    if (wantTotal > budget) {
-      const available = budget - imgTokens;
-      if (available < 512) return null; // images alone ate the budget
-      const flexible = Math.max(1, inputTokens + maxOutput);
-      const k = Math.min(1, available / flexible);
-      inputTokens = Math.floor(inputTokens * k);
-      maxOutput = Math.max(32, Math.floor(maxOutput * k));
-    }
-
-    // ── respect the money ceiling; shrink images too, since text scaling alone
-    //    cannot bring a vision-heavy request under a dollar cap
-    let estUsd = estimateCostUsd(model, { input: inputTokens + imgTokens, output: maxOutput });
-    if (estUsd > remUsd) {
-      const k = Math.max(0, remUsd / estUsd) * 0.98;
-      inputTokens = Math.floor(inputTokens * k);
-      maxOutput = Math.max(32, Math.floor(maxOutput * k));
-      const trimmed = Math.floor(imageCount * k);
-      if (trimmed < imageCount) {
-        imageCount = Math.max(0, trimmed);
-        imgTokens = imageCount * this.imgPerImage;
-      }
-      estUsd = estimateCostUsd(model, { input: inputTokens + imgTokens, output: maxOutput });
-    }
-
-    const fillerTokens = Math.max(0, inputTokens - imgTokens - 400); // ~400 for system+instruction
-    const estTokens = inputTokens + maxOutput + imgTokens;
-
-    if (maxOutput < 32) return null;
-
-    return {
-      maxOutput,
-      imageCount,
-      fillerTokens,
-      outputBias: this.cfg.shortOutput ? 'min' : 'max',
-      // What we believe we are sending. Used to settle the books when a vendor
-      // omits `usage` entirely — treating that case as "zero input" silently
-      // gave away the entire prompt cost.
-      estInput: inputTokens + imgTokens,
-      estOutput: maxOutput,
-      // Reservation carries a safety margin: if our token estimate is low (a
-      // vision model billing more than the formula predicted), the overshoot is
-      // absorbed here rather than showing up as an unbudgeted charge.
-      estTokens: Math.round(estTokens * 1.05),
-      estUsd: Math.max(0.0000001, estUsd * 1.15),
-    };
+  #accountInterrupted(plan, usage) {
+    // Only confirmed components enter the consumption meter. The unknown
+    // remainder stays committed, preventing retries from spending it twice.
+    const input = usage?.reported ? usage.input || 0 : 0;
+    const output = usage?.reported ? usage.output || 0 : 0;
+    const total = Math.max(usage?.reported ? usage.total || 0 : 0, input + output);
+    const usd = estimateCostUsd(this.model, { input, output, cached: usage?.cached || 0 });
+    this.stats.input += input;
+    this.stats.output += output;
+    this.stats.cached += usage?.cached || 0;
+    this.stats.reasoning += usage?.reasoning || 0;
+    this.stats.total += total;
+    this.stats.costUsd += usd;
+    this.stats.unknownUsage++;
+    this.unconfirmedTokens += Math.max(0, plan.estTokens - total);
+    this.unconfirmedUsd += Math.max(0, plan.estUsd - usd);
+    if (total || usd) this.samples.push({ t: Date.now(), tokens: total, usd, req: 0 });
   }
 
   #settle(plan, res, latencyMs) {
@@ -518,9 +558,7 @@ export class Burner extends EventEmitter {
       cached: u.cached || 0,
     });
 
-    this.reservedTokens -= plan.estTokens;
-    this.reservedUsd -= plan.estUsd;
-    this.reservedRequests -= 1;
+    this.#releasePlan(plan);
 
     const s = this.stats;
     s.requests++;
@@ -707,9 +745,10 @@ export class Burner extends EventEmitter {
 
   #reasonForLimits() {
     const s = this.stats;
-    if (s.total + this.reservedTokens >= this.limits.tokens) return 'token target reached';
-    if (s.costUsd + this.reservedUsd >= this.limits.usd) return 'budget reached';
-    if (s.requests + this.reservedRequests >= this.limits.requests) return 'request limit reached';
+    if (s.total + this.reservedTokens + this.unconfirmedTokens >= this.limits.tokens) return 'token target reached';
+    if (s.costUsd + this.reservedUsd + this.unconfirmedUsd >= this.limits.usd) return 'budget reached';
+    if (s.wire >= this.limits.requests) return 'request limit reached';
+    if (this.noPlanReason) return this.noPlanReason;
     return 'run complete';
   }
 
@@ -773,12 +812,7 @@ export class Burner extends EventEmitter {
       }
     }
 
-    if (key > tokens * 1.02) {
-      const ratio = tokens / key;
-      const cut = Math.max(200, Math.floor(text.length * ratio));
-      return text.slice(0, cut);
-    }
-    return text;
+    return trimFiller(text, tokens);
   }
 
   /* ── dry run ────────────────────────────────────────────────────────────── */
@@ -796,7 +830,7 @@ export class Burner extends EventEmitter {
     this.#log(
       'info',
       `DRY RUN — no requests will be sent.\n` +
-        `  one request: input ≈ ${fmt(plan.fillerTokens + plan.imageCount * this.imgPerImage + 400)} tok, ` +
+        `  one request: input ≈ ${fmt(plan.estInput)} tok, ` +
         `max output ${fmt(plan.maxOutput)} tok, images ${plan.imageCount}\n` +
         `  cost/request ≈ $${perUsd.toFixed(4)}\n` +
         `  concurrency ${this.cfg.concurrency} → ≈ ${fmt(Math.round(perReq * this.cfg.concurrency))} tok ` +

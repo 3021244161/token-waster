@@ -301,7 +301,7 @@ src/
     anthropic.js       Messages + thinking budget
     gemini.js          generateContent + 安全阈值
 public/                原生 HTML/CSS/JS，无构建步骤
-scripts/selftest.js    31 个离线测试（含 mock 厂商，覆盖三种协议）
+scripts/selftest.js    46 个离线测试（含 mock 厂商，覆盖三种协议）
 ```
 
 没有框架，没有 bundler，没有 `node_modules`。

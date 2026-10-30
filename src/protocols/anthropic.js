@@ -12,7 +12,7 @@
  *  - Output is counted, never accumulated (see openai.js for the reasoning).
  */
 
-import { postJson, readSse, joinUrl, emptyUsage, finalizeUsage, isShapeError } from './http.js';
+import { postJson, readSse, joinUrl, emptyUsage, finalizeUsage, isShapeError, throwIfError } from './http.js';
 import { makeSink, orderVariants } from './openai.js';
 
 function buildContent(payload, images) {
@@ -41,18 +41,20 @@ export async function callAnthropic({
   headers = {},
   preferredVariant = null,
   beforeSend = null,
+  afterSend = null,
 }) {
   const url = joinUrl(baseUrl, '/v1/messages');
   const messages = [{ role: 'user', content: buildContent(payload, images) }];
 
   const variants = [];
-  if (thinkingBudget > 1024) {
+  const manualBudget = Math.min(thinkingBudget, maxOutput - 1024);
+  if (manualBudget >= 1024) {
     variants.push({
       model,
       max_tokens: maxOutput,
       system: payload.system,
       messages,
-      thinking: { type: 'enabled', budget_tokens: Math.min(thinkingBudget, maxOutput - 1024) },
+      thinking: { type: 'enabled', budget_tokens: manualBudget },
       stream: true,
     });
   }
@@ -70,8 +72,11 @@ export async function callAnthropic({
     const sink = makeSink();
     const more = n < order.length - 1;
 
+    let sent = false;
+    let streaming = false;
     try {
       beforeSend?.();
+      sent = true;
 
       const res = await postJson(url, {
         headers: {
@@ -86,6 +91,7 @@ export async function callAnthropic({
 
       if (body.stream === false) {
         const json = await res.json();
+        throwIfError(json);
         usage.input = json?.usage?.input_tokens || 0;
         usage.output = json?.usage?.output_tokens || 0;
         usage.cached = json?.usage?.cache_read_input_tokens || 0;
@@ -94,14 +100,17 @@ export async function callAnthropic({
         return { usage: finalizeUsage(usage, sink.chars), textLength: sink.chars, sample: sink.sample, variant: vi };
       }
 
+      streaming = true;
       await readSse(res, {
         signal,
         idleMs: streamIdleMs,
         onData: (ev) => {
+          throwIfError(ev);
           if (ev.type === 'message_start') {
             const u = ev.message?.usage;
             if (u) {
               usage.input = u.input_tokens || 0;
+              usage.output = Math.max(usage.output, u.output_tokens || 0);
               usage.cached = u.cache_read_input_tokens || 0;
               usage.reported = true;
             }
@@ -123,15 +132,21 @@ export async function callAnthropic({
       return { usage: finalizeUsage(usage, sink.chars), textLength: sink.chars, sample: sink.sample, variant: vi };
     } catch (err) {
       lastErr = err;
+      if (streaming || err.streamFailure) {
+        err.streamFailure = true;
+        err.partialUsage = { ...usage };
+      }
       if (err?.budgetStop) {
         if (shapeErr) throw shapeErr;
         throw err;
       }
-      if (isShapeError(err) && more) {
+      if (!err.streamFailure && isShapeError(err) && more) {
         shapeErr = err;
         continue;
       }
       throw err;
+    } finally {
+      if (sent) afterSend?.();
     }
   }
   throw lastErr;

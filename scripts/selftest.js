@@ -18,6 +18,7 @@ import { Burner } from '../src/engine.js';
 import { estimateCostUsd } from '../src/config.js';
 import { renderReport } from '../src/report.js';
 import { callProvider } from '../src/protocols/index.js';
+import { runThroughputTests } from './review-throughput.js';
 
 const results = [];
 function test(name, fn) {
@@ -587,6 +588,7 @@ async function main() {
   });
 
   server.close();
+  results.push(...await runThroughputTests());
 
   /* ── report ── */
   const pad = (s, n) => s + ' '.repeat(Math.max(0, n - s.length));

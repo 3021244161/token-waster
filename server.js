@@ -142,6 +142,7 @@ function buildConfig(body) {
       currency: custom.currency || catalogModel?.price?.currency || 'USD',
     },
     vision: custom.vision ?? catalogModel?.vision ?? true,
+    reasoning: custom.reasoning ?? catalogModel?.reasoning ?? false,
   };
 
   const concurrency = num(body.concurrency, 4, { min: 1, max: HARD_MAX_CONCURRENCY });

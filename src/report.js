@@ -101,6 +101,7 @@ export function renderReport(data, { autoPrint = false } = {}) {
     'account drained': '账户余额耗尽',
     'token target reached': '达到 token 目标',
     'budget reached': '达到金额上限',
+    'remaining budget below minimum request cost': '剩余额度不足以发送最小请求',
     'request limit reached': '达到请求数上限',
     'time limit reached': '达到时长上限',
     'stopped by user': '手动停止',
@@ -275,7 +276,7 @@ ${areaChart(tl, { key: 'rate', color: '#b8860b' })}
 <div class="two">
   <table>
     <tr><td>结束原因</td><td class="num">${esc(reason)}</td></tr>
-    <tr><td>实际并发（峰值）</td><td class="num">${nf(s.peakInflight)} / ${nf((s.config || {}).concurrency)}</td></tr>
+    <tr><td>实际并发（峰值）</td><td class="num">${nf(s.peakActiveRequests ?? s.peakInflight)} / ${nf((s.config || {}).concurrency)}</td></tr>
     <tr><td>限流（429）次数</td><td class="num">${nf(s.throttled)}</td></tr>
     <tr><td>降温 / 恢复</td><td class="num">${nf(s.degraded)} / ${nf(s.recovered)}</td></tr>
   </table>
@@ -284,6 +285,8 @@ ${areaChart(tl, { key: 'rate', color: '#b8860b' })}
     <tr><td>延迟 P90</td><td class="num">${nf((s.latency || {}).p90)} ms</td></tr>
     <tr><td>延迟 P99</td><td class="num">${nf((s.latency || {}).p99)} ms</td></tr>
     <tr><td>估算用量占比</td><td class="num">${s.requests ? pct((s.estimateOnly || 0) / s.requests) : '0%'}</td></tr>
+    <tr><td>用量未完全确认的调用</td><td class="num">${nf(s.unknownUsage)}</td></tr>
+    <tr><td>待确认金额预留</td><td class="num">${money(s.unconfirmedUsd || 0)}</td></tr>
   </table>
 </div>
 
@@ -294,8 +297,9 @@ ${areaChart(tl, { key: 'rate', color: '#b8860b' })}
 
 <div class="note">
   <b>关于这份报告的数字。</b>
-  token 与费用来自服务商返回的 <span class="mono">usage</span> 字段，不是本地估算；<b>只有</b>
-  服务商未返回 usage 的请求才退化为字符数估算（见「估算用量占比」）。价格来自本项目的内置价格表，
+  用量优先采用服务商返回的 <span class="mono">usage</span> 字段；成功调用缺少回报时采用字符数估算。
+  中断调用只计入已确认部分，未知部分单列预留，不算作已消耗；费用仍由用量和价格表估算。
+  价格来自本项目的内置价格表，
   核对于 ${esc(new Date().toISOString().slice(0, 10))} 之前，<b>可能已过时</b>——最终账单以服务商结算为准。
   结束原因若显示「异常终止」，说明服务商返回了无法自动恢复的错误。
 </div>
