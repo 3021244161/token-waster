@@ -17,6 +17,21 @@ export async function runServerTests() {
   await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve));
   const port = listener.address().port;
   await new Promise(resolve => listener.close(resolve));
+
+  // A one-shot vendor stand-in, so /api/probe can be exercised end to end. Probe
+  // was the one endpoint with no coverage, which is exactly why it kept reading a
+  // field the adapters had stopped returning.
+  const vendor = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: 'OK' } }] }) + '\n\n');
+    res.write('data: ' + JSON.stringify({ choices: [], usage: { prompt_tokens: 11, completion_tokens: 2, total_tokens: 13 } }) + '\n\n');
+    res.write('data: [DONE]\n\n');
+    res.end();
+  });
+  await new Promise(resolve => vendor.listen(0, '127.0.0.1', resolve));
+  const vendorBase = 'http://127.0.0.1:' + vendor.address().port + '/v1';
+
   const child = spawn(process.execPath, [fileURLToPath(new URL('../server.js', import.meta.url))], {
     env: { ...process.env, PORT: String(port) }, windowsHide: true, stdio: 'ignore',
   });
@@ -67,6 +82,20 @@ export async function runServerTests() {
       assert.equal((await status()).config.maxFillerTokens, 2000000);
       assert.equal((await status()).wire, 0);
     });
+    await check('probe returns the completion sample and the reported usage', async () => {
+      const res = await fetch(base + '/api/probe', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ providerId: 'openai', apiKey: 'k', modelId: 'fixture', baseUrl: vendorBase }),
+        signal: AbortSignal.timeout(8000),
+      });
+      assert.equal(res.status, 200);
+      const out = await res.json();
+      assert.equal(out.ok, true, out.error);
+      assert.equal(out.sample, 'OK', 'sample must come from the adapter, not a dropped field');
+      assert.equal(out.usage.total, 13);
+      assert.equal(out.usage.input, 11);
+      assert.equal(out.usage.output, 2);
+    });
     await check('SSE backpressure destroys the bounded stream buffer', async () => {
       const stream = new PassThrough({ highWaterMark: 8 });
       assert.equal(writeSse(stream, 'x'.repeat(32)), false);
@@ -89,6 +118,7 @@ export async function runServerTests() {
       child.kill();
       await exited;
     }
+    await new Promise(resolve => vendor.close(resolve));
   }
   return results;
 }

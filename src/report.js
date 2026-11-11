@@ -104,7 +104,9 @@ export function renderReport(data, { autoPrint = false } = {}) {
     'remaining budget below minimum request cost': '剩余额度不足以发送最小请求',
     'request limit reached': '达到请求数上限',
     'time limit reached': '达到时长上限',
+    'rate limited beyond run deadline': '被限流直到运行截止，提前结束',
     'stopped by user': '手动停止',
+    'server shutting down': '服务端关闭，运行被中断',
     'run complete': '正常结束',
   };
   const reasonKey = String(s.stopReason || '');

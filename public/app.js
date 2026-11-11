@@ -356,6 +356,8 @@ function applySnapshot(s) {
   state.target.tps = s.tokensPerSec || 0;
 
   state.intensityTarget = Math.min(1, (s.tokensPerSec || 0) / 5000);
+  // The draw loop parks itself when idle, so throughput is what wakes it again.
+  if (state.intensityTarget > 0) wakeFire();
 
   $('gUsd').innerHTML = `$${(s.usdPerMin || 0).toFixed(4)}<span>/min</span>`;
   $('gTps').innerHTML = `${nf.format(s.tokensPerSec || 0)}<span>/s</span>`;
@@ -472,6 +474,14 @@ let dpr = Math.min(2, window.devicePixelRatio || 1);
 let particles = [];
 let emberAcc = 0;
 let warmed = false;
+/** True while the draw loop owns a pending frame; wakeFire() is the only restart. */
+let fireLoop = false;
+
+function wakeFire() {
+  if (fireLoop) return;
+  fireLoop = true;
+  requestAnimationFrame(drawFire);
+}
 
 /**
  * Pre-rendered ember sprites. Drawing 800 `drawImage` calls per frame is
@@ -501,6 +511,8 @@ function resizeFire() {
   fire.height = Math.floor(window.innerHeight * 0.42 * dpr);
   fire.style.height = '42vh';
   fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // Resizing the backing store wipes it, so repaint even when the loop is parked.
+  wakeFire();
 }
 
 function spawnParticle() {
@@ -580,10 +592,17 @@ function drawFire() {
   fctx.filter = 'none';
 
   // ── embers
-  emberAcc += 0.6 + i * 5;
-  while (emberAcc > 1) {
-    spawnParticle();
-    emberAcc -= 1;
+  // Only spawn while the fire is alive. Left unconditional, this kept creating
+  // embers on an idle page, so the particle list never drained and the loop above
+  // could never park itself — the exact spin this optimisation is meant to stop.
+  if (i >= 0.01 || state.intensityTarget > 0) {
+    emberAcc += 0.6 + i * 5;
+    while (emberAcc > 1) {
+      spawnParticle();
+      emberAcc -= 1;
+    }
+  } else {
+    emberAcc = 0;
   }
   if (particles.length > 700) particles.splice(0, particles.length - 700);
 
@@ -607,6 +626,16 @@ function drawFire() {
 
   fctx.globalAlpha = 1;
   fctx.globalCompositeOperation = 'source-over';
+
+  // Park the loop once the fire is out. The frame just painted *is* the resting
+  // image — the cold smouldering bed is part of the design, so clearing here
+  // would leave a dead black canvas. Releasing the loop instead of rescheduling
+  // matters: a self-driving timer keeps the compositor awake on an idle page and
+  // spins forever under virtual time, which deadlocks headless screenshots.
+  if (i < 0.01 && state.intensityTarget === 0 && particles.length === 0) {
+    fireLoop = false;
+    return;
+  }
 
   requestAnimationFrame(drawFire);
 }
@@ -645,17 +674,30 @@ function toast(msg, bad = false) {
   toast._t = setTimeout(() => (t.className = 'toast'), 4200);
 }
 
+// Mirrors the reasons the engine can actually emit. Substring regexes were the
+// previous approach and they silently missed several, so this is an exact table
+// plus a prefix pass for the `fatal: …` family.
+const REASON_TEXT = [
+  ['token target reached', '达到 token 目标'],
+  ['budget reached', '达到金额上限'],
+  ['remaining budget below minimum request cost', '剩余额度不足以发送最小请求'],
+  ['request limit reached', '达到请求数上限'],
+  ['time limit reached', '达到时长上限'],
+  ['rate limited beyond run deadline', '被限流直到运行截止，提前结束'],
+  ['account drained', '账户已燃尽'],
+  ['stopped by user', '你按下了停止'],
+  ['server shutting down', '服务端关闭，运行被中断'],
+  ['run complete', '正常结束'],
+];
+
 function reasonText(r) {
-  if (!r) return '未知原因';
-  if (r === 'remaining budget below minimum request cost') return '剩余额度不足以发送最小请求';
-  if (/token target/.test(r)) return '达到 token 目标';
-  if (/budget/.test(r)) return '达到金额上限';
-  if (/request limit/.test(r)) return '达到请求数上限';
-  if (/time limit/.test(r)) return '达到时长上限';
-  if (/user/.test(r)) return '你按下了停止';
-  if (/account drained/.test(r)) return '账户已燃尽';
-  if (/fatal/.test(r)) return `致命错误：${r.replace(/^fatal:\s*/, '')}`;
-  return r;
+  const key = String(r || '').trim();
+  if (!key) return '未知原因';
+  for (const [needle, label] of REASON_TEXT) if (key === needle) return label;
+  for (const [needle, label] of REASON_TEXT) if (key.startsWith(needle)) return label;
+  if (key.startsWith('fatal')) return `致命错误：${key.replace(/^fatal:\s*/, '').slice(0, 120)}`;
+  // Unknown reasons stay verbatim: a raw string beats a confident wrong guess.
+  return key;
 }
 
 const STRATEGY_HINT = {
@@ -790,6 +832,6 @@ $('strategyHint').textContent = STRATEGY_HINT['max-output'];
 $('log').innerHTML = '<div class="row empty"><span class="m">还没开始。</span></div>';
 $('report').disabled = true;
 resizeFire();
-requestAnimationFrame(drawFire);
+wakeFire();
 requestAnimationFrame(animateNumbers);
 boot().catch((e) => toast(`启动失败：${e.message}`, true));

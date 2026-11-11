@@ -421,7 +421,7 @@ const routes = {
         ok: true,
         ms: Date.now() - t0,
         usage: out.usage,
-        sample: (out.text || '').slice(0, 200),
+        sample: String(out.sample || '').slice(0, 200),
         variant: out.variant,
       });
     } catch (err) {

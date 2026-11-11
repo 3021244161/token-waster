@@ -9,6 +9,7 @@
  */
 
 import http from 'node:http';
+import fs from 'node:fs';
 import zlib from 'node:zlib';
 import assert from 'node:assert/strict';
 
@@ -586,6 +587,44 @@ async function main() {
     const snap = await b.run();
     assert.equal(snap.requests, 0);
     assert.ok(b.logs.some((l) => /DRY RUN/.test(l.msg)));
+  });
+
+  /* ── stop-reason coverage ── */
+  // The UI and the report each keep their own label table, and both had drifted
+  // from what the engine actually emits. Reading the sources keeps the three in
+  // sync without a build step, which is the whole point of a zero-dependency app.
+  const readSrc = (rel) => fs.readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
+
+  await testAsync('every stop reason the engine emits has a UI and report label', async () => {
+    const engineSrc = readSrc('src/engine.js');
+    const serverSrc = readSrc('server.js');
+    const reasons = new Set([
+      ...[...engineSrc.matchAll(/this\.stop\('([^']+)'\)/g)].map((m) => m[1]),
+      ...[...engineSrc.matchAll(/noPlanReason = '([^']+)'/g)].map((m) => m[1]),
+      ...[...serverSrc.matchAll(/\.stop\('([^']+)'\)/g)].map((m) => m[1]),
+    ]);
+    // `fatal: …` is a template literal and is handled by a prefix branch, so it
+    // never appears in the tables.
+    const limits = engineSrc.match(/#reasonForLimits\(\)\s*\{[\s\S]*?\n  \}/);
+    assert.ok(limits, 'could not locate #reasonForLimits()');
+    for (const m of limits[0].matchAll(/return '([^']+)'/g)) reasons.add(m[1]);
+
+    assert.ok(reasons.size >= 8, `only found ${reasons.size} stop reasons`);
+
+    const uiBlock = readSrc('public/app.js').match(/const REASON_TEXT = \[[\s\S]*?\n\];/);
+    assert.ok(uiBlock, 'could not locate REASON_TEXT in public/app.js');
+    const uiLabels = new Set([...uiBlock[0].matchAll(/\['([a-z][a-z ]+)',/g)].map((m) => m[1]));
+
+    const reportBlock = readSrc('src/report.js').match(/const reasonMap = \{[\s\S]*?\n  \};/);
+    assert.ok(reportBlock, 'could not locate reasonMap in src/report.js');
+    const reportLabels = new Set([...reportBlock[0].matchAll(/'([a-z][a-z ]+)':/g)].map((m) => m[1]));
+
+    const missing = [];
+    for (const r of reasons) {
+      if (!uiLabels.has(r)) missing.push(`UI: ${r}`);
+      if (!reportLabels.has(r)) missing.push(`report: ${r}`);
+    }
+    assert.deepEqual(missing, [], `unlabelled stop reasons → ${missing.join(' | ')}`);
   });
 
   server.close();
