@@ -161,6 +161,39 @@ function startMock() {
 
       // A fussy model that rejects oversized completions, to exercise the
       // engine's ability to shrink its own numbers instead of failing forever.
+      // The mirror image of a lenient clone: an endpoint that only speaks the
+      // newer OpenAI spelling. Everything else now goes out with max_tokens
+      // first, so this is what proves the fallback still reaches
+      // max_completion_tokens instead of dying on the first 400.
+      if (body.model === 'strict-maxcompletion-model' && body.max_tokens !== undefined) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        return res.end(
+          JSON.stringify({
+            error: {
+              message:
+                "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
+            },
+          }),
+        );
+      }
+
+      // Silently ignores the output ceiling, the way DeepSeek dropped
+      // max_completion_tokens: answers 200 and generates its own size. The
+      // ledger has to notice from usage and start reserving against it.
+      if (body.model === 'runaway-model') {
+        const out = 20000;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'x' } }] })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [],
+            usage: { prompt_tokens: 500, completion_tokens: out, total_tokens: 500 + out },
+          })}\n\n`,
+        );
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+
       if (body.model === 'picky-model' && maxOut > 4000) {
         res.writeHead(400, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ error: { message: 'max_tokens is too large for this model' } }));
@@ -515,15 +548,74 @@ async function main() {
     assert.ok(snap.input >= 1000, `expected 500×2 input, got ${snap.input}`);
   });
 
-  await testAsync('the working parameter variant is remembered, not re-probed', async () => {
+  await testAsync('a clone that only knows max_tokens succeeds on the first shape', async () => {
     wireHits = 0;
     const b = new Burner(cfgFor(port, { modelId: 'variant-model', limitRequests: 40, concurrency: 1, limitTokens: 2000000 }));
     const snap = await b.run();
     assert.ok(snap.ok >= 5, `expected several calls, got ${snap.ok}`);
-    // 1 probe (2 calls) + 1 call each afterwards. Without the memory it would be
-    // 2 calls every time.
-    assert.ok(wireHits <= snap.ok + 3, `${wireHits} wire calls for ${snap.ok} successes — variant not reused`);
-    assert.ok(b.variantProfile !== null, 'variant should be recorded');
+    // max_tokens is the first shape now, so there is nothing to probe: each
+    // success costs exactly one wire call. The old order spent two 400s finding
+    // that out, and on an endpoint that ignores unknown fields it never found out
+    // at all — it just ran to its own ceiling.
+    assert.equal(wireHits, snap.ok, `${wireHits} wire calls for ${snap.ok} successes`);
+    assert.equal(b.variantProfile, 0, 'the first shape should be the one remembered');
+  });
+
+  await testAsync('an endpoint that rejects max_tokens still falls back and remembers it', async () => {
+    wireHits = 0;
+    const b = new Burner(
+      cfgFor(port, {
+        modelId: 'strict-maxcompletion-model',
+        concurrency: 1,
+        limitTokens: 2000000,
+        limitRequests: 20,
+        effort: 'low',
+      }),
+    );
+    const snap = await b.run();
+    assert.ok(snap.ok >= 3, `expected several calls, got ${snap.ok}`);
+    // Both max_tokens shapes are refused, so the remembered one must be a
+    // max_completion_tokens shape, and later calls must reuse it rather than
+    // re-walking the dead ones.
+    assert.ok(b.variantProfile >= 2, `expected a fallback variant, got v${b.variantProfile}`);
+    assert.ok(wireHits <= snap.ok + 3, `${wireHits} wire calls for ${snap.ok} successes — fallback not reused`);
+  });
+
+  await testAsync('an endpoint that ignores the output ceiling is measured, not trusted', async () => {
+    const b = new Burner(
+      cfgFor(port, {
+        modelId: 'runaway-model',
+        model: { id: 'runaway', ctx: 200000, maxOut: 8000, price: { in: 1, out: 2, currency: 'USD' }, vision: false },
+        concurrency: 1,
+        limitTokens: 100000,
+        limitUsd: Infinity,
+        limitDurationMs: 8000,
+      }),
+    );
+    const snap = await b.run();
+    assert.ok(b.outputOvershoot > 1.15, `expected a learned overshoot, got ${b.outputOvershoot}`);
+    assert.ok(b.logs.some((l) => /未遵守输出上限/.test(l.msg)), 'the run should say the ceiling was ignored');
+    // Once the ratio is learned the next reservation no longer fits, so the run
+    // stops after one full-size request instead of repeating it to the target.
+    assert.ok(snap.wire <= 2, `${snap.wire} requests sent after the ceiling was found to be ignored`);
+  });
+
+  await testAsync('crossing the target stops the run with the right reason', async () => {
+    const b = new Burner(
+      cfgFor(port, {
+        modelId: 'runaway-model',
+        model: { id: 'runaway', ctx: 200000, maxOut: 8000, price: { in: 1, out: 2, currency: 'USD' }, vision: false },
+        concurrency: 2,
+        limitTokens: 31000,
+        limitUsd: Infinity,
+        limitDurationMs: 8000,
+      }),
+    );
+    const snap = await b.run();
+    // Two 20.5K responses against a 31K ceiling: the second settle crosses it, and
+    // the run has to end there rather than reporting a tidy "run complete".
+    assert.ok(snap.total >= 31000, `expected the ceiling to be crossed, got ${snap.total}`);
+    assert.equal(snap.stopReason, 'token target reached');
   });
 
   await testAsync('quota is split per slot so concurrency actually opens up', async () => {

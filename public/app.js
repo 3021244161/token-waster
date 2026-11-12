@@ -413,12 +413,17 @@ function updateProgress(s) {
   $('pLabel').textContent = label;
 
   if (total > 0) {
-    const pct = Math.min(100, (value / total) * 100);
-    $('pFill').style.width = `${pct}%`;
-    $('pText').textContent = `${fmt(value)} / ${fmt(total)}  ·  ${pct.toFixed(1)}%` +
+    const raw = (value / total) * 100;
+    // Report the real ratio. Clamping the label to 100% made the one case that
+    // most needs saying — 160,230 against a 100,000 target — read as "100.0%",
+    // so the bar and the counter told different stories.
+    $('pFill').style.width = `${Math.min(100, raw)}%`;
+    $('pFill').classList.toggle('over', raw > 100.5);
+    $('pText').textContent = `${fmt(value)} / ${fmt(total)}  ·  ${raw.toFixed(1)}%` +
       (s.unknownUsage ? ' · 含中断调用的待确认预留' : '');
   } else {
     $('pFill').style.width = '0%';
+    $('pFill').classList.remove('over');
     $('pText').textContent = `${fmt(value)} · 未设目标`;
   }
 }

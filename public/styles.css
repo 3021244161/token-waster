@@ -818,6 +818,17 @@ code { font-family: var(--sans); color: var(--ember); background: rgba(255, 138,
   transition: width 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
   box-shadow: 0 0 14px rgba(255, 120, 0, 0.5);
 }
+/* Overshoot: the bar is pinned at full width, so colour and texture carry the
+   message. Diagonal hazard stripes read as "over the line" without needing the
+   reader to compare two numbers. */
+.p-fill.over {
+  background-image: repeating-linear-gradient(
+    45deg,
+    #ff2d00 0 6px,
+    #ffb300 6px 12px
+  );
+  box-shadow: 0 0 18px rgba(255, 45, 0, 0.85);
+}
 
 .log-wrap {
   border: 1px solid var(--line);

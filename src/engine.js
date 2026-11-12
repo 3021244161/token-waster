@@ -35,6 +35,10 @@ const MAX_TIMELINE = 2400;
 const TOKEN_MARGIN = 1.05;
 const COST_MARGIN = 1.15;
 const MIN_OUTPUT = 32;
+/** Output above this fraction of what we asked for counts as a broken ceiling. */
+const OVERSHOOT_TOLERANCE = 1.15;
+/** Cap on the learned ratio: one pathological request must not freeze the run. */
+const MAX_OVERSHOOT = 6;
 
 export class Burner extends EventEmitter {
   constructor(cfg) {
@@ -102,6 +106,14 @@ export class Burner extends EventEmitter {
     this.lastRecoveryAt = 0;
     /** The parameter variant that last worked for this endpoint, or null. */
     this.variantProfile = null;
+    /**
+     * Learned ratio between what we asked a model to generate and what it
+     * actually generated. Endpoints that silently ignore the output ceiling are
+     * invisible to variant probing, so measure the damage and reserve against it:
+     * with four requests in flight, a 3x overshoot turns a 100K target into 160K.
+     */
+    this.outputOvershoot = 1;
+    this.overshootNoted = false;
     // Requests physically on the wire. Distinct from `inflight`, which counts
     // *permits* — a worker waiting for budget still holds a permit.
     this.sending = 0;
@@ -511,8 +523,15 @@ export class Burner extends EventEmitter {
     // Reserve first; actual preparation yields to cancellation. Exact trimming
     // guarantees the generated filler never exceeds this estimate.
     const estInput = overhead + fillerTokens + imgTokens;
-    const estTokens = Math.ceil((estInput + maxOutput) * TOKEN_MARGIN);
-    const estUsd = estimateCostUsd(model, { input: estInput, output: maxOutput }) * COST_MARGIN;
+    // Reserve against the *observed* output ratio rather than the requested one.
+    // When an endpoint ignores the ceiling, the request still asks for `maxOutput`
+    // (that is the only number it can honour elsewhere) but the ledger has to
+    // assume it will overshoot, or four in-flight requests each overspend and the
+    // target is blown before any of them settles. The context check below keeps
+    // using the requested value: that is what the endpoint will accept or reject.
+    const reservedOutput = Math.max(maxOutput, Math.round(maxOutput * this.outputOvershoot));
+    const estTokens = Math.ceil((estInput + reservedOutput) * TOKEN_MARGIN);
+    const estUsd = estimateCostUsd(model, { input: estInput, output: reservedOutput }) * COST_MARGIN;
     if (estTokens > remTokens || estUsd > remUsd + 1e-12 || estInput + maxOutput > ctx) {
       this.noPlanReason = 'remaining budget below minimum request cost';
       return null;
@@ -571,6 +590,30 @@ export class Burner extends EventEmitter {
     s.costUsd += actualUsd;
     if (!u.reported) s.estimateOnly++;
 
+    // Did the endpoint honour the output ceiling? One that silently ignores the
+    // field answers 200 and generates against its own default, so usage is the
+    // only signal available. Learn the ratio and carry it into future
+    // reservations: with four requests in flight, a 3x overshoot turns a 100K
+    // target into 160K before anything has settled.
+    if (plan.maxOutput > MIN_OUTPUT && outTok > plan.maxOutput * OVERSHOOT_TOLERANCE) {
+      const ratio = Math.min(MAX_OVERSHOOT, outTok / plan.maxOutput);
+      if (ratio > this.outputOvershoot) this.outputOvershoot = ratio;
+      if (!this.overshootNoted) {
+        this.overshootNoted = true;
+        this.#log(
+          'warn',
+          `端点未遵守输出上限：请求 ${fmt(plan.maxOutput)}、实际 ${fmt(outTok)}` +
+            `（${ratio.toFixed(1)}×）。后续按该倍率预留额度，实际消耗会低于目标。`,
+        );
+      }
+    }
+
+    // Stop the moment the ceiling is actually crossed instead of waiting for the
+    // worker loop to notice. Every other request still on the wire would run to
+    // completion first, and one of them can be three times its planned size.
+    if (s.total >= this.limits.tokens) this.stop('token target reached');
+    else if (s.costUsd >= this.limits.usd) this.stop('budget reached');
+
     this.samples.push({ t: Date.now(), tokens: actualTokens, usd: actualUsd, req: 1 });
     this.consecutive429 = 0;
 
@@ -598,10 +641,20 @@ export class Burner extends EventEmitter {
     if (err?.budgetStop) return;
 
     if (err?.name === 'AbortError' || this.ac.signal.aborted) {
+      // A request we cancelled ourselves did not fail: the run was already over
+      // — target crossed, user pressed stop, deadline hit. Counting it as a
+      // failure made a clean convergence report "1 failed" and dragged the
+      // success rate down, which reads as a provider problem that never happened.
+      // Its usage may still have been billed upstream, so it goes on the
+      // unconfirmed pile instead of disappearing.
+      if (this.state === 'stopping') {
+        s.unknownUsage++;
+        return;
+      }
       s.requests++;
       s.failed++;
       s.lastError = msg;
-      if (this.state !== 'stopping') this.#log('warn', 'request aborted');
+      this.#log('warn', 'request aborted');
       return;
     }
 

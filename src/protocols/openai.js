@@ -35,6 +35,34 @@ function buildVariants({ model, payload, images, maxOutput, effort }) {
 
   const out = [];
 
+  // `max_tokens` goes first, deliberately.
+  //
+  // Variant probing can only see rejections. An endpoint that *ignores* an
+  // unknown field answers 200 and then generates against its own default
+  // ceiling — measured on DeepSeek, max_completion_tokens was dropped on the
+  // floor and a request planned for 8K output produced 26K. That failure mode is
+  // invisible to the probe, so the shape more endpoints actually honour has to be
+  // tried first. OpenAI's reasoning models reject max_tokens with a 400 that
+  // mentions "max_completion_tokens", which is a shape error we can fall through.
+  if (effort) {
+    out.push({
+      model,
+      messages,
+      max_tokens: maxOutput,
+      reasoning_effort: effort,
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+  }
+
+  out.push({
+    model,
+    messages,
+    max_tokens: maxOutput,
+    stream: true,
+    stream_options: { include_usage: true },
+  });
+
   if (effort) {
     out.push({
       model,
@@ -50,14 +78,6 @@ function buildVariants({ model, payload, images, maxOutput, effort }) {
     model,
     messages,
     max_completion_tokens: maxOutput,
-    stream: true,
-    stream_options: { include_usage: true },
-  });
-
-  out.push({
-    model,
-    messages,
-    max_tokens: maxOutput,
     stream: true,
     stream_options: { include_usage: true },
   });
